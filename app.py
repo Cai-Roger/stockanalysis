@@ -5,18 +5,29 @@ import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 
 # 1. 網頁基礎設定
-st.set_page_config(page_title="市場動態掃描看盤", layout="wide")
+st.set_page_config(page_title="專業級即時監控 & 選股", layout="wide")
 
-# --- 動態抓取清單函數 ---
-@st.cache_data(ttl=3600) # 快取一小時，避免重複抓取影響效能
-def get_market_tickers(market_type):
+# --- 動態抓取清單與名稱函數 ---
+@st.cache_data(ttl=3600)
+def get_market_data(market_type):
+    # 定義代碼與名稱的對照，減少 API 請求負擔
     if market_type == "美股 (US)":
-        # 抓取標普 500 前 20 檔 (簡化示範)
-        return ["AAPL", "NVDA", "MSFT", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "LLY", "JPM", "V", "MA", "UNH", "COST", "HD"]
-    else:
-        # 抓取台灣 50 (0050) 的主要成份股代碼
-        tw_50 = ["2330", "2317", "2454", "2308", "2382", "3231", "2881", "2882", "2357", "2886", "2603", "2891", "2412", "1301", "1303", "2005"]
-        return tw_50
+        return {
+            "AAPL": "蘋果", "NVDA": "輝達", "MSFT": "微軟", "AMZN": "亞馬遜", 
+            "GOOGL": "Google", "META": "臉書", "TSLA": "特斯拉", "AVGO": "博通", 
+            "AMD": "超微", "NFLX": "網飛", "COST": "好市多"
+        }
+    elif market_type == "台股上市 (TW)":
+        return {
+            "2330": "台積電", "2317": "鴻海", "2454": "聯發科", "2308": "台達電", 
+            "2382": "廣達", "3231": "緯創", "2603": "長榮", "1513": "中興電",
+            "2881": "富邦金", "2882": "國泰金", "2357": "華碩"
+        }
+    else: # 台股上櫃
+        return {
+            "8069": "元太", "6488": "環球晶", "3105": "穩懋", "3529": "力旺", 
+            "8299": "群聯", "6182": "合晶", "3293": "鈊象", "6223": "旺矽"
+        }
 
 # 2. 側邊欄設定
 with st.sidebar:
@@ -34,7 +45,7 @@ with st.sidebar:
 # 3. 設定頁籤
 tab1, tab2 = st.tabs(["📈 即時看盤", "🔥 市場動態推薦"])
 
-# --- 頁籤 1: 即時看盤 (維持原本功能) ---
+# --- 頁籤 1: 即時看盤 (加入公司名稱) ---
 with tab1:
     if not symbol:
         st.info("💡 請在左側輸入代號開始監控。")
@@ -45,6 +56,9 @@ with tab1:
 
         try:
             stock = yf.Ticker(full_symbol)
+            # 獲取公司名稱
+            company_name = stock.info.get('longName', '未知公司')
+            
             df = stock.history(period="2y", interval="1d")
             if not df.empty:
                 df['MA5'] = df['Close'].rolling(5).mean()
@@ -57,7 +71,9 @@ with tab1:
                 chg = curr_p - prev_c
                 pct = (chg / prev_c) * 100
 
-                st.metric(f"{full_symbol}", f"{curr_p:.2f}", f"{chg:.2f} ({pct:.2f}%)")
+                # 標題顯示 公司名稱 + 代號
+                st.subheader(f"{company_name} ({full_symbol})")
+                st.metric("即時股價", f"{curr_p:.2f}", f"{chg:.2f} ({pct:.2f}%)")
 
                 fig = go.Figure()
                 display_df = df.tail(65)
@@ -68,12 +84,13 @@ with tab1:
                     customdata=display_df['Pct'],
                     hovertemplate="漲跌幅: %{customdata:.2f}%<extra></extra>"
                 ))
+                # 均線
                 fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA5'], name='MA5', line=dict(color='#FFD700', width=1.3)))
                 fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA10'], name='MA10', line=dict(color='#FF8C00', width=1.3)))
                 fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA20'], name='MA20', line=dict(color='#FF00FF', width=1.3)))
                 fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA60'], name='MA60', line=dict(color='#00BFFF', width=1.3)))
 
-                fig.update_layout(height=650, template="plotly_dark", uirevision=full_symbol, xaxis_rangeslider_visible=False)
+                fig.update_layout(height=600, template="plotly_dark", uirevision=full_symbol, xaxis_rangeslider_visible=False)
                 fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
                 st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
             else:
@@ -81,19 +98,18 @@ with tab1:
         except Exception as e:
             st.error(f"連線錯誤: {e}")
 
-# --- 頁籤 2: 市場動態推薦 (自動抓取市場領頭羊) ---
+# --- 頁籤 2: 市場動態推薦 (加入公司名稱列) ---
 with tab2:
     st.header(f"🚀 {market} 動態領先指標")
-    st.write("系統自動掃描目前市場權值股，並依即時強度排序：")
+    
+    market_map = get_market_data(market)
+    tickers = list(market_map.keys())
 
-    # 根據目前的市場選擇，自動獲取一組動態代號
-    current_tickers = get_market_tickers(market)
-
-    if current_tickers:
+    if tickers:
         rec_data = []
-        progress_bar = st.progress(0) # 進度條增加使用者體驗
+        progress_bar = st.progress(0)
         
-        for idx, s in enumerate(current_tickers):
+        for idx, s in enumerate(tickers):
             fs = s
             if "台股" in market:
                 suffix = ".TW" if "上市" in market else ".TWO"
@@ -101,30 +117,25 @@ with tab2:
             
             try:
                 t = yf.Ticker(fs)
-                h = t.history(period="10d") # 抓取稍微長一點確保 MA 計算正確
-                if len(h) >= 5:
+                h = t.history(period="5d")
+                if len(h) >= 2:
                     c_p = h['Close'].iloc[-1]
                     p_p = h['Close'].iloc[-2]
                     p_pct = ((c_p - p_p) / p_p) * 100
-                    
-                    # 計算短線強弱：站上 5MA 且今日上漲
                     ma5 = h['Close'].rolling(5).mean().iloc[-1]
-                    vol_avg = h['Volume'].mean()
-                    curr_vol = h['Volume'].iloc[-1]
                     
-                    strength = "🔥 強勢" if (c_p > ma5 and p_pct > 0) else "☁️ 整理"
-                    if curr_vol > vol_avg * 1.5: strength = "💎 爆量起飛"
-
+                    status = "📈 多頭" if c_p > ma5 else "☁️ 整理"
+                    
                     rec_data.append({
+                        "公司": market_map[s], # 加入中文名稱
                         "代號": s,
                         "最新價": round(c_p, 2),
                         "漲跌幅%": round(p_pct, 2),
-                        "趨勢評級": strength,
-                        "相對音量": round(curr_vol / vol_avg, 1)
+                        "趨勢評級": status
                     })
             except:
                 continue
-            progress_bar.progress((idx + 1) / len(current_tickers))
+            progress_bar.progress((idx + 1) / len(tickers))
         
         if rec_data:
             df_rec = pd.DataFrame(rec_data).sort_values(by="漲跌幅%", ascending=False)
@@ -135,11 +146,10 @@ with tab2:
 
             styled_df = df_rec.style.map(apply_color, subset=['漲跌幅%'])
             st.dataframe(styled_df, use_container_width=True, hide_index=True)
-            st.success(f"已完成 {len(rec_data)} 檔權值股即時掃描。")
         else:
-            st.error("掃描過程中發生錯誤，請稍後再試。")
+            st.error("掃描失敗。")
     else:
-        st.warning("目前該市場無可掃描的動態名單。")
+        st.warning("查無名單。")
 
 st.divider()
-st.caption("備註：動態推薦由標普 500 與 台灣 50 成份股組成，代表市場整體趨勢。")
+st.caption("數據來源：Yahoo Finance | 更新時間：" + pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S'))
