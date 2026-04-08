@@ -3,7 +3,6 @@ try:
     import yfinance as yf
 except ImportError:
     os.system('pip install yfinance pandas matplotlib')
-import yfinance as yf
 import streamlit as st
 import yfinance as yf
 import pandas as pd
