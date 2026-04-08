@@ -1,45 +1,76 @@
+import streamlit as st
 import yfinance as yf
 import pandas as pd
 import matplotlib.pyplot as plt
 
-def analyze_stock(stock_symbol, period="6mo"):
-    # 1. 下載股市數據
-    print(f"正在獲取 {stock_symbol} 的數據...")
-    data = yf.download(stock_symbol, period=period)
-    
-    if data.empty:
-        print("找不到該股票代碼，請檢查後再試。")
-        return
+# 設定網頁標題
+st.set_page_config(page_title="簡易股市分析小工具", layout="wide")
 
-    # 2. 計算技術指標：移動平均線 (SMA)
-    data['MA5'] = data['Close'].rolling(window=5).mean()
-    data['MA20'] = data['Close'].rolling(window=20).mean()
+st.title("📈 簡易股市分析小工具")
+st.markdown("這是一個基於 Python 的自動化股市分析程式，支援台股與美股。")
 
-    # 3. 簡單策略判斷 (黃金交叉/死亡交叉)
-    latest_ma5 = data['MA5'].iloc[-1]
-    latest_ma20 = data['MA20'].iloc[-1]
-    
-    print(f"\n--- {stock_symbol} 分析結果 ---")
-    print(f"最新收盤價: {data['Close'].iloc[-1]:.2f}")
-    print(f"5日均線: {latest_ma5:.2f}")
-    print(f"20日均線: {latest_ma20:.2f}")
+# --- 側邊欄設定 ---
+st.sidebar.header("參數設定")
+stock_id = st.sidebar.text_input("請輸入股票代號", value="2330.TW")
+st.sidebar.info("提示：台股請加 .TW (如 2330.TW)，美股直接輸入 (如 AAPL)")
 
-    if latest_ma5 > latest_ma20:
-        print("趨勢提示：目前 5MA > 20MA，呈現偏多排列。")
+period_options = {
+    "1個月": "1mo",
+    "3個月": "3mo",
+    "6個月": "6mo",
+    "1年": "1y",
+    "2年": "2y"
+}
+selected_period = st.sidebar.selectbox("選擇分析時間範圍", list(period_options.keys()))
+
+# --- 抓取數據 ---
+@st.cache_data # 快取數據，避免重複下載
+def load_data(symbol, range):
+    data = yf.download(symbol, period=period_options[range])
+    return data
+
+try:
+    df = load_data(stock_id, selected_period)
+
+    if df.empty:
+        st.error("找不到該股票代號，請檢查格式是否正確。")
     else:
-        print("趨勢提示：目前 5MA < 20MA，呈現偏空排列。")
+        # --- 數據處理 ---
+        df['MA5'] = df['Close'].rolling(window=5).mean()
+        df['MA20'] = df['Close'].rolling(window=20).mean()
 
-    # 4. 繪製圖表
-    plt.figure(figsize=(12, 6))
-    plt.plot(data['Close'], label='Close Price', color='black', alpha=0.5)
-    plt.plot(data['MA5'], label='5-Day MA', color='blue')
-    plt.plot(data['MA20'], label='20-Day MA', color='red')
-    plt.title(f'Stock Price Analysis: {stock_symbol}')
-    plt.xlabel('Date')
-    plt.ylabel('Price')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+        # --- 顯示關鍵指標 ---
+        col1, col2, col3 = st.columns(3)
+        latest_price = df['Close'].iloc[-1]
+        latest_ma5 = df['MA5'].iloc[-1]
+        latest_ma20 = df['MA20'].iloc[-1]
 
-# 執行分析：台股請加 .TW (例如 2330.TW)，美股直接輸入代號 (例如 AAPL)
-analyze_stock("2330.TW")
+        col1.metric("最新收盤價", f"{latest_price:.2f}")
+        col2.metric("5日均線 (MA5)", f"{latest_ma5:.2f}")
+        col3.metric("20日均線 (MA20)", f"{latest_ma20:.2f}")
+
+        # --- 多空趨勢判斷 ---
+        if latest_ma5 > latest_ma20:
+            st.success("🔥 目前趨勢：**多頭排列** (5MA > 20MA)")
+        else:
+            st.warning("❄️ 目前趨勢：**空頭排列** (5MA < 20MA)")
+
+        # --- 繪製圖表 ---
+        st.subheader(f"{stock_id} 股價走勢與均線")
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(df.index, df['Close'], label='Close Price', color='gray', alpha=0.3)
+        ax.plot(df.index, df['MA5'], label='5-Day MA', color='blue', linewidth=1.5)
+        ax.plot(df.index, df['MA20'], label='20-Day MA', color='red', linewidth=1.5)
+        ax.legend()
+        ax.grid(True, linestyle='--', alpha=0.6)
+        st.pyplot(fig)
+
+        # --- 顯示數據表格 ---
+        with st.expander("查看原始數據"):
+            st.dataframe(df.tail(20))
+
+except Exception as e:
+    st.error(f"發生錯誤: {e}")
+
+st.sidebar.markdown("---")
+st.sidebar.write("Powered by Gemini & Streamlit")
