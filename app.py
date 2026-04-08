@@ -78,7 +78,7 @@ with tab1:
         except Exception as e:
             st.error(f"連線錯誤: {e}")
 
-# --- 頁籤 2: 股票推薦 (帶顏色區分) ---
+# --- 頁籤 2: 股票推薦 (修正顏色報錯) ---
 with tab2:
     st.header("🔥 市場強勢股觀察名單")
     
@@ -111,16 +111,20 @@ with tab2:
         
         df_rec = pd.DataFrame(rec_data).sort_values(by="漲跌幅%", ascending=False)
 
-        # 定義顏色函數：正數紅色，負數綠色 (台股習慣)
-        def color_pick(val):
-            color = '#ef5350' if val > 0 else '#26a69a' if val < 0 else 'white'
-            return f'color: {color}; font-weight: bold'
+        # 修正後的顏色函數
+        def apply_color(val):
+            if val > 0:
+                return 'color: #ef5350; font-weight: bold;' # 漲：紅
+            elif val < 0:
+                return 'color: #26a69a; font-weight: bold;' # 跌：綠
+            return ''
 
-        # 套用樣式到「漲跌幅%」這一欄
-        styled_df = df_rec.style.applymap(color_pick, subset=['漲跌幅%'])
+        # 使用 map 代替 applymap (相容新版 Pandas)
+        styled_df = df_rec.style.map(apply_color, subset=['漲跌幅%'])
 
-        st.write(f"當前市場：**{target_market}** (依漲幅排序)")
-        st.table(styled_df) # 使用 st.table 或 st.dataframe 顯示樣式
+        st.write(f"當前市場：**{target_market}**")
+        # 顯示表格
+        st.dataframe(styled_df, use_container_width=True, hide_index=True)
         
         st.info("💡 顏色說明：紅色代表今日上漲，綠色代表今日下跌。")
     else:
