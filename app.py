@@ -10,25 +10,28 @@ st.set_page_config(page_title="台美股查詢器", layout="wide")
 with st.sidebar:
     st.title("設定")
     market = st.radio("市場", ('美股 (US)', '台股上市 (TW)', '台股上櫃 (TWO)'))
-    symbol = st.text_input("股票代號", value="2330")
-    period = st.selectbox("區間", ["3mo", "6mo", "1y", "2y"], index=1)
+    # 將 value 設定為空字串 ""，取消預設代號
+    symbol = st.text_input("請輸入股票代號", value="")
+    period = st.selectbox("查詢區間", ["3mo", "6mo", "1y", "2y"], index=1)
 
-# 代號處理
-full_symbol = symbol.upper()
-if symbol:
+# 主畫面
+if not symbol:
+    st.title("📈 股票行情查詢系統")
+    st.info("請在左側輸入股票代號（例如：AAPL 或 2330）開始查詢。")
+else:
+    # 代號處理邏輯
+    full_symbol = symbol.upper()
     if market == '台股上市 (TW)':
         full_symbol = f"{symbol}.TW"
     elif market == '台股上櫃 (TWO)':
         full_symbol = f"{symbol}.TWO"
 
-# 主畫面
-st.title(f"股票行情: {full_symbol}")
+    st.title(f"📊 股票行情: {full_symbol}")
 
-if symbol:
     try:
         # 抓取資料
         data = yf.Ticker(full_symbol)
-        df = data.history(period="2y") # 多抓一點算均線
+        df = data.history(period="2y")
         
         if not df.empty:
             # 計算均線
@@ -42,9 +45,9 @@ if symbol:
             elif period == "1y": display_df = df.tail(255)
             else: display_df = df.tail(510)
 
-            # 顯示價格
+            # 顯示目前價格
             curr_price = df['Close'].iloc[-1]
-            st.metric("目前股價", f"{curr_price:.2f}")
+            st.metric("當前收盤價", f"{curr_price:.2f}")
 
             # 畫圖
             fig = go.Figure()
@@ -67,16 +70,20 @@ if symbol:
                 height=600,
                 xaxis_rangeslider_visible=False,
                 template="plotly_white",
-                hovermode="x unified"
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
             )
             
-            # 移除假日
+            # 移除假日空隙
             fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
 
             st.plotly_chart(fig, use_container_width=True)
             
         else:
-            st.error("查無資料")
+            st.error(f"找不到代號 '{full_symbol}' 的資料，請檢查代號與市場選擇是否正確。")
 
     except Exception as e:
         st.error(f"發生錯誤: {e}")
+
+st.divider()
+st.caption("提示：美股不需後綴；台股請依市場選擇「上市」或「上櫃」。")
