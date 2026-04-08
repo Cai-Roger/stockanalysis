@@ -33,7 +33,7 @@ else:
     try:
         stock = yf.Ticker(full_symbol)
         
-        # 預抓資料以計算 MA
+        # 預抓資料以計算 MA 與 漲跌幅
         df = stock.history(period="2y", interval="1d")
 
         if not df.empty:
@@ -43,39 +43,51 @@ else:
             df['MA20'] = df['Close'].rolling(20).mean()
             df['MA60'] = df['Close'].rolling(60).mean()
             
+            # --- 計算每日漲跌幅 % ---
+            df['Daily_Change_Pct'] = df['Close'].pct_change() * 100
+            
             # 根據選擇的區間切分資料
             if period == "1mo": display_df = df.tail(22)
             elif period == "3mo": display_df = df.tail(65)
             elif period == "6mo": display_df = df.tail(125)
             else: display_df = df.tail(255)
 
-            # 顯示報價卡片
+            # --- 顯示即時漲跌數據 ---
             curr_price = df['Close'].iloc[-1]
             prev_close = df['Close'].iloc[-2]
             change = curr_price - prev_close
-            st.metric(f"{full_symbol}", f"{curr_price:.2f}", f"{change:.2f}")
+            change_pct = (change / prev_close) * 100
+            
+            # 使用 delta 顯示漲跌幅
+            st.metric(
+                label=f"{full_symbol} 即時行情", 
+                value=f"{curr_price:.2f}", 
+                delta=f"{change:.2f} ({change_pct:.2f}%)"
+            )
 
             # 4. 繪製圖表
             fig = go.Figure()
 
-            # K線
+            # K線 (加入自定義資訊到 Hover)
             fig.add_trace(go.Candlestick(
                 x=display_df.index, open=display_df['Open'], high=display_df['High'],
                 low=display_df['Low'], close=display_df['Close'], name='日K',
-                increasing_line_color='#ef5350', decreasing_line_color='#26a69a'
+                increasing_line_color='#ef5350', decreasing_line_color='#26a69a',
+                customdata=display_df['Daily_Change_Pct'],
+                hovertemplate="日期: %{x}<br>開盤: %{open}<br>最高: %{high}<br>最低: %{low}<br>收盤: %{close}<br>漲跌幅: %{customdata:.2f}%<extra></extra>"
             ))
 
-            # --- 均線配置更新 ---
-            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA5'], name='MA5', line=dict(color='#FFD700', width=1.3))) # 黃色
-            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA10'], name='MA10', line=dict(color='#FF8C00', width=1.3))) # 橘色 (改色)
-            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA20'], name='MA20', line=dict(color='#FF00FF', width=1.3))) # 粉紅
-            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA60'], name='MA60', line=dict(color='#00BFFF', width=1.3))) # 藍色
+            # 均線配置
+            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA5'], name='MA5', line=dict(color='#FFD700', width=1.3)))
+            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA10'], name='MA10', line=dict(color='#FF8C00', width=1.3)))
+            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA20'], name='MA20', line=dict(color='#FF00FF', width=1.3)))
+            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA60'], name='MA60', line=dict(color='#00BFFF', width=1.3)))
 
             # 圖表設定
             fig.update_layout(
                 height=700,
-                template="plotly_dark", # 深色模式
-                uirevision=full_symbol, # 鎖定視圖狀態，刷新不跑掉
+                template="plotly_dark",
+                uirevision=full_symbol,
                 xaxis_rangeslider_visible=False,
                 hovermode="x unified",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
@@ -83,8 +95,7 @@ else:
 
             fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
 
-            # 使用 config 增加互動體驗 (支援滾輪縮放)
             st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
 
     except Exception as e:
-        st.error(f"數據抓取失敗：{e}")
+        st.error(f"數據更新失敗：{e}")
