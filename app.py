@@ -1,65 +1,72 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import plotly.graph_objects as go
 
 # 設定網頁標題
-st.set_page_config(page_title="台美股自動查詢器", page_icon="💰")
+st.set_page_config(page_title="台美股 K線查詢器", page_icon="📊", layout="wide")
 
-st.title("💰 台美股自動查詢工具")
-st.write("只需輸入代碼，系統會自動處理後綴！")
+st.title("📊 專業級 K 線指標查詢")
 
-# 第一步：選擇市場
-market = st.radio(
-    "請選擇市場：",
-    ('美股 (US)', '台股上市 (TW)', '台股上櫃 (TWO)'),
-    horizontal=True
-)
+# 側邊欄設定
+with st.sidebar:
+    st.header("查詢設定")
+    market = st.radio("選擇市場", ('美股 (US)', '台股上市 (TW)', '台股上櫃 (TWO)'))
+    raw_symbol = st.text_input("輸入代號", value="2330").strip()
+    period = st.selectbox("時間範圍", ("1mo", "3mo", "6mo", "1y", "2y"), index=1)
 
-# 第二步：輸入代號 (不需手動加點)
-raw_symbol = st.text_input("請輸入股票代號（例如: AAPL 或 2330）", value="").strip()
-
-# 第三步：自動拼接後綴邏輯
+# 自動拼接後綴
 processed_symbol = raw_symbol.upper()
 if raw_symbol:
     if market == '台股上市 (TW)':
         processed_symbol = f"{raw_symbol}.TW"
     elif market == '台股上櫃 (TWO)':
         processed_symbol = f"{raw_symbol}.TWO"
-    # 美股則保持原樣
 
-# 查詢按鈕
-if st.button("立即查詢"):
-    if not raw_symbol:
-        st.warning("請先輸入代號！")
-    else:
-        try:
-            with st.spinner(f'正在搜尋 {processed_symbol} ...'):
-                stock = yf.Ticker(processed_symbol)
-                info = stock.info
-                
-                # 檢查是否真的抓到資料
-                if 'currentPrice' in info or 'regularMarketPrice' in info:
-                    long_name = info.get('longName', '未知公司')
-                    price = info.get('currentPrice') or info.get('regularMarketPrice')
-                    currency = info.get('currency', 'USD')
-                    
-                    # 顯示資訊卡片
-                    st.success(f"查詢成功：{processed_symbol}")
-                    col1, col2 = st.columns(2)
-                    col1.metric("公司名稱", long_name)
-                    col2.metric("當前股價", f"{price} {currency}")
-                    
-                    # 顯示簡易走勢圖
-                    hist = stock.history(period="1mo")
-                    if not hist.empty:
-                        st.subheader("最近一個月走勢圖")
-                        st.line_chart(hist['Close'])
-                else:
-                    st.error(f"找不到 '{processed_symbol}'，請確認代號與市場是否匹配。")
-                    
-        except Exception as e:
-            st.error(f"發生錯誤：請檢查網路或代號是否正確。")
-            st.expander("錯誤細節").write(e)
+if raw_symbol:
+    try:
+        stock = yf.Ticker(processed_symbol)
+        # 抓取歷史資料
+        df = stock.history(period=period)
+        
+        if not df.empty:
+            # 顯示基本資訊
+            info = stock.info
+            name = info.get('longName', processed_symbol)
+            price = info.get('currentPrice') or info.get('regularMarketPrice')
+            currency = info.get('currency', 'USD')
+            
+            st.metric(label=name, value=f"{price} {currency}")
 
-st.divider()
-st.caption("提示：美股如 AAPL, TSLA；台股如 2330, 0050")
+            # 繪製 K 線圖
+            fig = go.Figure(data=[go.Candlestick(
+                x=df.index,
+                open=df['Open'],
+                high=df['High'],
+                low=df['Low'],
+                close=df['Close'],
+                name='K線',
+                increasing_line_color= '#ef5350', # 上漲紅 (符合台股習慣)
+                decreasing_line_color= '#26a69a'  # 下跌綠
+            )])
+
+            fig.update_layout(
+                title=f"{name} ({processed_symbol}) 歷史走勢",
+                yaxis_title="價格",
+                xaxis_rangeslider_visible=False, # 隱藏下方的滑桿讓畫面乾淨點
+                template="plotly_white",
+                height=600
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # 顯示原始數據表格
+            with st.expander("查看歷史數據明細"):
+                st.dataframe(df.sort_index(ascending=False))
+        else:
+            st.error("查無資料，請確認代號是否正確。")
+            
+    except Exception as e:
+        st.error(f"查詢失敗：{e}")
+else:
+    st.info("請在左側輸入代號開始查詢")
