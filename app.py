@@ -37,9 +37,9 @@ else:
         df = stock.history(period="2y", interval="1d")
 
         if not df.empty:
-            # --- 新增/計算均線 ---
+            # --- 計算均線 ---
             df['MA5'] = df['Close'].rolling(5).mean()
-            df['MA10'] = df['Close'].rolling(10).mean() # 補上 10日線
+            df['MA10'] = df['Close'].rolling(10).mean()
             df['MA20'] = df['Close'].rolling(20).mean()
             df['MA60'] = df['Close'].rolling(60).mean()
             
@@ -65,17 +65,17 @@ else:
                 increasing_line_color='#ef5350', decreasing_line_color='#26a69a'
             ))
 
-            # 均線配置 (MA10 設為白色)
-            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA5'], name='MA5', line=dict(color='#FFD700', width=1.2)))
-            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA10'], name='MA10', line=dict(color='#FFFFFF', width=1.2))) # 白色 MA10
-            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA20'], name='MA20', line=dict(color='#FF00FF', width=1.2)))
-            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA60'], name='MA60', line=dict(color='#00BFFF', width=1.2)))
+            # --- 均線配置更新 ---
+            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA5'], name='MA5', line=dict(color='#FFD700', width=1.3))) # 黃色
+            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA10'], name='MA10', line=dict(color='#FF8C00', width=1.3))) # 橘色 (改色)
+            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA20'], name='MA20', line=dict(color='#FF00FF', width=1.3))) # 粉紅
+            fig.add_trace(go.Scatter(x=display_df.index, y=display_df['MA60'], name='MA60', line=dict(color='#00BFFF', width=1.3))) # 藍色
 
             # 圖表設定
             fig.update_layout(
                 height=700,
-                template="plotly_dark",
-                uirevision=full_symbol, # 鎖定視圖狀態
+                template="plotly_dark", # 深色模式
+                uirevision=full_symbol, # 鎖定視圖狀態，刷新不跑掉
                 xaxis_rangeslider_visible=False,
                 hovermode="x unified",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
@@ -83,7 +83,7 @@ else:
 
             fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
 
-            # 使用 config 增加互動體驗 (縮放不重置)
+            # 使用 config 增加互動體驗 (支援滾輪縮放)
             st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
 
     except Exception as e:
