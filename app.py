@@ -7,7 +7,7 @@ from streamlit_autorefresh import st_autorefresh
 # 1. 網頁基礎設定
 st.set_page_config(page_title="類股輪動全監控", layout="wide")
 
-# --- 定義「類股全覆蓋」資料庫 (依產業邏輯分類) ---
+# --- 定義「類股全覆蓋」資料庫 ---
 def get_extended_categorized_map(market_type):
     if "台股" in market_type:
         return {
@@ -28,16 +28,15 @@ def get_extended_categorized_map(market_type):
             # --- 金融 ---
             "2881": ("金融-金控", "富邦金"), "2882": ("金融-金控", "國泰金"), "2891": ("金融-金控", "中信金"),
             "2886": ("金融-金控", "兆豐金"), "2884": ("金融-金控", "玉山金"),
-            # --- 其它亮點 ---
+            # --- 其它 ---
             "8069": ("電子紙", "元太"), "3293": ("遊戲博弈", "鈊象"), "8299": ("記憶體", "群聯")
         }
-    else: # 美股 (權值與熱門科技)
+    else: # 美股
         return {
             "NVDA": ("AI/晶片", "輝達"), "AAPL": ("消費電子", "蘋果"), "MSFT": ("雲端/AI", "微軟"),
             "TSLA": ("電動車", "特斯拉"), "AMD": ("AI/晶片", "超微"), "AVGO": ("通信/晶片", "博通"),
             "AMZN": ("電商/雲端", "亞馬遜"), "GOOGL": ("軟體/廣告", "Google"), "META": ("社群/AI", "臉書"),
-            "JPM": ("金融", "摩根大通"), "V": ("金融/支付", "Visa"), "XOM": ("能源", "埃克森美孚"),
-            "LLY": ("醫療生技", "禮來"), "COST": ("零售", "好市多"), "NFLX": ("媒體娛樂", "網飛")
+            "JPM": ("金融", "摩根大通"), "V": ("金融/支付", "Visa"), "XOM": ("能源", "埃克森美孚")
         }
 
 # 2. 側邊欄
@@ -52,10 +51,36 @@ with st.sidebar:
 
 tab1, tab2 = st.tabs(["🔍 個股分析", "🏘️ 類股輪動狀態"])
 
-# --- 頁籤 2: 類股群組掃描 (真正落實類股區分) ---
+# --- 頁籤 1: 個股分析 ---
+with tab1:
+    if not symbol: st.info("💡 請在左側輸入代號。")
+    else:
+        full_s = f"{symbol.upper()}.TW" if "上市" in market else f"{symbol.upper()}.TWO" if "上櫃" in market else symbol.upper()
+        try:
+            stock = yf.Ticker(full_s)
+            df = stock.history(period="2y")
+            if not df.empty:
+                for m in [5, 10, 20, 60]: df[f'MA{m}'] = df['Close'].rolling(m).mean()
+                df['Pct'] = df['Close'].pct_change() * 100
+                st.subheader(f"即時報價: {full_s}")
+                curr_p, prev_c = df['Close'].iloc[-1], df['Close'].iloc[-2]
+                st.metric("股價", f"{curr_p:.2f}", f"{curr_p-prev_c:.2f} ({(curr_p-prev_c)/prev_c*100:.2f}%)")
+                
+                fig = go.Figure()
+                d_df = df.tail(80)
+                fig.add_trace(go.Candlestick(x=d_df.index, open=d_df['Open'], high=d_df['High'], low=d_df['Low'], close=d_df['Close'], name='K線', increasing_line_color='#ef5350', decreasing_line_color='#26a69a'))
+                colors = ['#FFD700', '#FF8C00', '#FF00FF', '#00BFFF']
+                for m, c in zip([5, 10, 20, 60], colors):
+                    fig.add_trace(go.Scatter(x=d_df.index, y=d_df[f'MA{m}'], name=f'MA{m}', line=dict(color=c, width=1.5)))
+                fig.update_layout(height=650, template="plotly_dark", uirevision=full_s, xaxis_rangeslider_visible=False)
+                fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+                st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
+            else: st.error("查無數據")
+        except: st.error("錯誤")
+
+# --- 頁籤 2: 類股輪動 (修正排序錯誤) ---
 with tab2:
     st.header(f"🏘️ {market} 類股動態一覽")
-    
     category_map = get_extended_categorized_map(market)
     tickers = list(category_map.keys())
     
@@ -63,7 +88,6 @@ with tab2:
     progress_bar = st.progress(0, text="同步各類股數據中...")
     
     for idx, s in enumerate(tickers):
-        # 決定正確代號後綴
         fs = f"{s}.TW" if "上市" in market else f"{s}.TWO" if "上櫃" in market else s
         try:
             h = yf.Ticker(fs).history(period="5d")
@@ -74,7 +98,7 @@ with tab2:
                     "族群": category_map[s][0],
                     "公司": category_map[s][1],
                     "代號": s,
-                    "最新價": round(c_p, 1),
+                    "價格": round(c_p, 1),
                     "今日漲跌%": round(((c_p - p_p) / p_p) * 100, 2),
                     "量能比": round(v_curr / v_avg, 1)
                 })
@@ -84,19 +108,16 @@ with tab2:
     if scanned_data:
         full_df = pd.DataFrame(scanned_data)
         
-        # 1. 族群排行 (小卡片顯示)
+        # 1. 族群排行 (頂部小卡片)
         st.subheader("📊 今日強勢族群排行")
         group_perf = full_df.groupby("族群")["今日漲跌%"].mean().sort_values(ascending=False)
         cols = st.columns(4)
         for i, (grp, val) in enumerate(group_perf.items()):
-            if i < 4:
-                cols[i].metric(grp, f"{val:.2f}%", delta=f"{val:.2f}%")
+            if i < 4: cols[i].metric(grp, f"{val:.2f}%", delta=f"{val:.2f}%")
 
-        # 2. 分類清單顯示
+        # 2. 分類清單 (修正點：先將陣列轉為清單再排序)
         st.write("---")
-        unique_groups = full_df['族群'].unique()
-        # 依照族群名稱排序
-        unique_groups.sort()
+        unique_groups = sorted(list(full_df['族群'].unique())) # 關鍵修正：轉 list 並用內建 sorted
         
         for group in unique_groups:
             st.markdown(f"#### 📁 {group}")
@@ -106,16 +127,5 @@ with tab2:
                 color = "#ef5350" if val > 0 else "#26a69a" if val < 0 else "gray"
                 return f'color: {color}; font-weight: bold;'
             
-            # 使用 dataframe 顯示，隱藏 index
-            st.dataframe(
-                group_df.style.map(color_val, subset=['今日漲跌%']), 
-                use_container_width=True, 
-                hide_index=True
-            )
-        
+            st.dataframe(group_df.style.map(color_val, subset=['今日漲跌%']), use_container_width=True, hide_index=True)
         progress_bar.empty()
-    else:
-        st.error("暫時無法取得資料。")
-
-st.divider()
-st.caption("備註：本清單包含台美股主要權值與類股領先標的，可視為全市場輪動之縮影。")
