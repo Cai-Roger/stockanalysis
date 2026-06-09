@@ -130,6 +130,7 @@ def fetch_json(url: str, params: dict = None, retry: int = MAX_RETRY) -> dict | 
 
 def save_csv(df: pd.DataFrame, filename: str) -> Path:
     """儲存 DataFrame 為 UTF-8-BOM CSV（Excel 可直接開啟）。"""
+    df = fix_duplicate_columns(df)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     path = OUTPUT_DIR / filename
     df.to_csv(path, index=False, encoding="utf-8-sig")
@@ -239,6 +240,20 @@ def clean_number(series: pd.Series) -> pd.Series:
         .replace("", np.nan)
         .pipe(pd.to_numeric, errors="coerce")
     )
+
+
+def fix_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    移除 DataFrame 中重複的欄位，保留第一個出現的。
+    （PyArrow 與部分 CSV 讀取不允許重複欄名）
+    """
+    seen: set[str] = set()
+    keep = []
+    for i, col in enumerate(df.columns):
+        if col not in seen:
+            seen.add(col)
+            keep.append(i)
+    return df.iloc[:, keep]
 
 
 # ─── 各類資料抓取 ────────────────────────────────────────────────────────────
@@ -890,11 +905,31 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+def dedup_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    PyArrow（Streamlit 底層）不允許重複欄位名。
+    將重複欄位加上 _2、_3… 後綴以避免 ValueError。
+    """
+    seen: dict[str, int] = {}
+    new_cols = []
+    for col in df.columns:
+        if col in seen:
+            seen[col] += 1
+            new_cols.append(f"{col}_{seen[col]}")
+        else:
+            seen[col] = 1
+            new_cols.append(col)
+    df = df.copy()
+    df.columns = new_cols
+    return df
+
+
 def show_table(df: pd.DataFrame, label: str, filename: str):
     """顯示資料表格 + 下載按鈕。"""
     if df is None or df.empty:
         st.warning(f"{label}：無資料（可能非交易日或尚未發布）")
         return
+    df = dedup_columns(df)
     st.caption(f"共 {len(df):,} 筆")
     st.dataframe(df, use_container_width=True, height=400)
     st.download_button(
@@ -983,6 +1018,7 @@ if fetch_btn:
             df = None
 
         if df is not None and not df.empty:
+            df = fix_duplicate_columns(df)
             # 同時存 CSV 到本地（Streamlit Cloud 可能唯讀，忽略錯誤）
             try:
                 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
