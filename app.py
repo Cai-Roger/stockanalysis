@@ -72,6 +72,9 @@ ENDPOINTS = {
 # 台股收盤日（週六週日不抓）
 WEEKDAYS = {0, 1, 2, 3, 4}   # Mon–Fri
 
+# 即時報價（TWSE MIS API）
+REALTIME_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+
 
 # ─── 日誌設定 ────────────────────────────────────────────────────────────────
 
@@ -551,6 +554,149 @@ def fetch_tpex_margin(date_str: str) -> pd.DataFrame | None:
     return df
 
 
+# ─── 即時報價（TWSE MIS API）────────────────────────────────────────────────
+
+def fetch_realtime_quote(codes: list) -> list:
+    """
+    從 TWSE MIS API 抓取多支股票的即時報價。
+    自動同時嘗試上市(tse_)和上櫃(otc_)；過濾掉無資料項目。
+    回傳解析後的 dict list，含五檔委買/委賣。
+    """
+    if not codes:
+        return []
+
+    # 每個代號同時送 tse_ 和 otc_，API 只回傳有效的那一筆
+    ex_ch = "|".join(
+        f"tse_{c.strip()}.tw|otc_{c.strip()}.tw"
+        for c in codes if c.strip()
+    )
+    params = {
+        "ex_ch": ex_ch,
+        "json":  "1",
+        "delay": "0",
+        "_":     int(time.time() * 1000),
+    }
+
+    try:
+        resp = requests.get(
+            REALTIME_URL, params=params, headers=HEADERS,
+            timeout=10, stream=False
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.warning("[即時報價] 抓取失敗：%s", e)
+        return []
+
+    def _flt(item, key, default=None):
+        val = item.get(key, "")
+        if val in ("-", "--", "", None):
+            return default
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return default
+
+    results_map: dict = {}   # code → dict（去除重複，保留有成交的）
+
+    for item in data.get("msgArray", []):
+        code = item.get("c", "").strip()
+        if not code:
+            continue
+        z = _flt(item, "z")          # 最新成交價
+        y = _flt(item, "y")          # 昨收
+
+        # 若同一代號已有有成交的紀錄，跳過這筆無成交紀錄
+        if code in results_map and results_map[code]["最新價"] is not None and z is None:
+            continue
+
+        change     = round(z - y, 2) if z is not None and y else None
+        change_pct = round((z - y) / y * 100, 2) if z is not None and y else None
+        ex         = item.get("ex", "tse")
+
+        # ── 五檔委買（由高到低）
+        bid_ps = [p for p in item.get("b", "").split("_") if p not in ("", "-")]
+        bid_qs = [q for q in item.get("g", "").split("_") if q not in ("", "-")]
+        bids = []
+        for p, q in zip(bid_ps[:5], bid_qs[:5]):
+            try:
+                bids.append({"委買價": float(p), "委買量(張)": int(q)})
+            except ValueError:
+                pass
+
+        # ── 五檔委賣（由低到高）
+        ask_ps = [p for p in item.get("a", "").split("_") if p not in ("", "-")]
+        ask_qs = [q for q in item.get("f", "").split("_") if q not in ("", "-")]
+        asks = []
+        for p, q in zip(ask_ps[:5], ask_qs[:5]):
+            try:
+                asks.append({"委賣價": float(p), "委賣量(張)": int(q)})
+            except ValueError:
+                pass
+
+        v_raw = _flt(item, "v", 0)
+        results_map[code] = {
+            "代號":       code,
+            "名稱":       item.get("n", ""),
+            "市場":       "上市" if ex == "tse" else "上櫃",
+            "最新價":     z,
+            "昨收":       y,
+            "漲跌":       change,
+            "漲跌幅(%)":  change_pct,
+            "開盤":       _flt(item, "o"),
+            "最高":       _flt(item, "h"),
+            "最低":       _flt(item, "l"),
+            "成交量(張)": int(v_raw) if v_raw else 0,
+            "漲停":       _flt(item, "u"),
+            "跌停":       _flt(item, "w"),
+            "更新時間":   item.get("t", ""),
+            "_bids":      bids,
+            "_asks":      asks,
+        }
+
+    # 依輸入順序排列結果
+    ordered = []
+    for c in codes:
+        c = c.strip()
+        if c in results_map:
+            ordered.append(results_map[c])
+    return ordered
+
+
+def fetch_intraday_chart(code: str, exchange: str = "tse") -> pd.DataFrame | None:
+    """
+    抓取單支股票當日分鐘 K 線（Yahoo Finance 公開 API）。
+    code：台股代號（如 2330）；exchange：tse（上市）或 otc（上櫃）。
+    """
+    suffix = ".TW" if exchange == "tse" else ".TWO"
+    url    = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}{suffix}"
+    params = {"interval": "1m", "range": "1d", "_": int(time.time() * 1000)}
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=10, stream=False)
+        resp.raise_for_status()
+        data   = resp.json()
+        result = data["chart"]["result"]
+        if not result:
+            return None
+        r          = result[0]
+        timestamps = r.get("timestamp", [])
+        quote      = r["indicators"]["quote"][0]
+        if not timestamps:
+            return None
+        df = pd.DataFrame({
+            "時間":       [datetime.fromtimestamp(ts).strftime("%H:%M") for ts in timestamps],
+            "開盤":       quote.get("open",   [None] * len(timestamps)),
+            "最高":       quote.get("high",   [None] * len(timestamps)),
+            "最低":       quote.get("low",    [None] * len(timestamps)),
+            "收盤":       quote.get("close",  [None] * len(timestamps)),
+            "成交量(張)": [int(v / 1000) if v else 0 for v in quote.get("volume", [0] * len(timestamps))],
+        })
+        return df.dropna(subset=["收盤"]).reset_index(drop=True)
+    except Exception as e:
+        logger.warning("[當日走勢] 抓取失敗 %s%s：%s", code, suffix, e)
+        return None
+
+
 # ─── 5. 技術指標計算 ─────────────────────────────────────────────────────────
 
 def calc_ma(series: pd.Series, window: int) -> pd.Series:
@@ -986,82 +1132,250 @@ with st.sidebar:
 
 # ─── 主畫面 ──────────────────────────────────────────────────────────────────
 
-st.header(f"台股每日資料  {selected_date.strftime('%Y/%m/%d')}")
+tab_daily, tab_rt = st.tabs(["📊 每日資料抓取", "📡 即時股價"])
 
-# Session state 儲存抓到的 DataFrame
-if "data" not in st.session_state:
-    st.session_state.data = {}
 
-# ── 抓取按鈕 ──────────────────────────────────────────────────────────────────
-if fetch_btn:
-    tasks = []
-    if chk_twse_stock: tasks.append(("上市個股",   fetch_stock_all,         f"上市個股_{date_str}.csv"))
-    if chk_twse_index: tasks.append(("加權指數",   fetch_taiex,             f"加權指數_{date_str}.csv"))
-    if chk_twse_inst:  tasks.append(("上市三大法人", fetch_institutional,    f"上市三大法人_{date_str}.csv"))
-    if chk_twse_marg:  tasks.append(("上市融資融券", fetch_margin,           f"上市融資融券_{date_str}.csv"))
-    if chk_tpex_stock: tasks.append(("上櫃個股",   fetch_tpex_stock_all,    f"上櫃個股_{date_str}.csv"))
-    if chk_tpex_index: tasks.append(("櫃買指數",   fetch_tpex_index,        f"櫃買指數_{date_str}.csv"))
-    if chk_tpex_inst:  tasks.append(("上櫃三大法人", fetch_tpex_institutional, f"上櫃三大法人_{date_str}.csv"))
-    if chk_tpex_marg:  tasks.append(("上櫃融資融券", fetch_tpex_margin,      f"上櫃融資融券_{date_str}.csv"))
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 1：每日資料抓取
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_daily:
+    st.subheader(f"每日資料  {selected_date.strftime('%Y/%m/%d')}")
 
-    progress = st.progress(0, text="準備中…")
-    status   = st.status("抓取中…", expanded=True)
+    if "data" not in st.session_state:
+        st.session_state.data = {}
 
-    st.session_state.data = {}
-    for i, (label, fn, fname) in enumerate(tasks):
-        progress.progress((i) / len(tasks), text=f"正在抓取：{label}")
-        status.write(f"⏳ {label}…")
-        try:
-            df = fn(date_str)
-        except Exception as e:
-            status.write(f"❌ {label} 發生錯誤：{e}")
-            df = None
+    # ── 抓取按鈕 ──────────────────────────────────────────────────────────────
+    if fetch_btn:
+        tasks = []
+        if chk_twse_stock: tasks.append(("上市個股",     fetch_stock_all,          f"上市個股_{date_str}.csv"))
+        if chk_twse_index: tasks.append(("加權指數",     fetch_taiex,              f"加權指數_{date_str}.csv"))
+        if chk_twse_inst:  tasks.append(("上市三大法人",  fetch_institutional,      f"上市三大法人_{date_str}.csv"))
+        if chk_twse_marg:  tasks.append(("上市融資融券",  fetch_margin,             f"上市融資融券_{date_str}.csv"))
+        if chk_tpex_stock: tasks.append(("上櫃個股",     fetch_tpex_stock_all,     f"上櫃個股_{date_str}.csv"))
+        if chk_tpex_index: tasks.append(("櫃買指數",     fetch_tpex_index,         f"櫃買指數_{date_str}.csv"))
+        if chk_tpex_inst:  tasks.append(("上櫃三大法人",  fetch_tpex_institutional,  f"上櫃三大法人_{date_str}.csv"))
+        if chk_tpex_marg:  tasks.append(("上櫃融資融券",  fetch_tpex_margin,        f"上櫃融資融券_{date_str}.csv"))
 
-        if df is not None and not df.empty:
-            df = fix_duplicate_columns(df)
-            # 同時存 CSV 到本地（Streamlit Cloud 可能唯讀，忽略錯誤）
+        progress = st.progress(0, text="準備中…")
+        status   = st.status("抓取中…", expanded=True)
+        st.session_state.data = {}
+
+        for i, (label, fn, fname) in enumerate(tasks):
+            progress.progress(i / len(tasks), text=f"正在抓取：{label}")
+            status.write(f"⏳ {label}…")
             try:
-                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                df.to_csv(OUTPUT_DIR / fname, index=False, encoding="utf-8-sig")
-            except Exception:
-                pass
-            st.session_state.data[label] = (df, fname)
-            status.write(f"✅ {label}：{len(df):,} 筆")
-        else:
-            status.write(f"⚠️ {label}：無資料")
+                df = fn(date_str)
+            except Exception as e:
+                status.write(f"❌ {label} 發生錯誤：{e}")
+                df = None
 
-        time.sleep(1.0)
-
-    progress.progress(1.0, text="完成！")
-    status.update(label="抓取完成", state="complete")
-
-# ── 顯示結果 ─────────────────────────────────────────────────────────────────
-if st.session_state.data:
-    tabs = st.tabs(list(st.session_state.data.keys()))
-    for tab, (label, (df, fname)) in zip(tabs, st.session_state.data.items()):
-        with tab:
-            show_table(df, label, fname)
-else:
-    st.info("請選擇日期與抓取項目，再按「🚀 開始抓取」。")
-
-# ── 技術指標 ─────────────────────────────────────────────────────────────────
-if ta_btn and ta_stock.strip():
-    code = ta_stock.strip()
-    with st.spinner(f"計算 {code} 技術指標中…"):
-        try:
-            compute_ta_for_stock(code)
-            ta_path = OUTPUT_DIR / f"ta_{code}.csv"
-            if ta_path.exists():
-                df_ta = pd.read_csv(ta_path, encoding="utf-8-sig", dtype=str)
-                st.subheader(f"📊 {code} 技術指標")
-                st.dataframe(df_ta, use_container_width=True, height=400)
-                st.download_button(
-                    "⬇ 下載技術指標 CSV",
-                    data=df_to_csv_bytes(df_ta),
-                    file_name=f"ta_{code}.csv",
-                    mime="text/csv",
-                )
+            if df is not None and not df.empty:
+                df = fix_duplicate_columns(df)
+                try:
+                    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                    df.to_csv(OUTPUT_DIR / fname, index=False, encoding="utf-8-sig")
+                except Exception:
+                    pass
+                st.session_state.data[label] = (df, fname)
+                status.write(f"✅ {label}：{len(df):,} 筆")
             else:
-                st.warning(f"找不到 {code} 的歷史資料，請先用 --range 批次抓取後再試。")
-        except Exception as e:
-            st.error(f"技術指標計算失敗：{e}")
+                status.write(f"⚠️ {label}：無資料")
+            time.sleep(1.0)
+
+        progress.progress(1.0, text="完成！")
+        status.update(label="抓取完成", state="complete")
+
+    # ── 顯示結果 ──────────────────────────────────────────────────────────────
+    if st.session_state.data:
+        data_tabs = st.tabs(list(st.session_state.data.keys()))
+        for dtab, (label, (df, fname)) in zip(data_tabs, st.session_state.data.items()):
+            with dtab:
+                show_table(df, label, fname)
+    else:
+        st.info("請選擇日期與抓取項目，再按「🚀 開始抓取」。")
+
+    # ── 技術指標 ──────────────────────────────────────────────────────────────
+    if ta_btn and ta_stock.strip():
+        code = ta_stock.strip()
+        with st.spinner(f"計算 {code} 技術指標中…"):
+            try:
+                compute_ta_for_stock(code)
+                ta_path = OUTPUT_DIR / f"ta_{code}.csv"
+                if ta_path.exists():
+                    df_ta = pd.read_csv(ta_path, encoding="utf-8-sig", dtype=str)
+                    st.subheader(f"📊 {code} 技術指標")
+                    st.dataframe(df_ta, use_container_width=True, height=400)
+                    st.download_button(
+                        "⬇ 下載技術指標 CSV",
+                        data=df_to_csv_bytes(df_ta),
+                        file_name=f"ta_{code}.csv",
+                        mime="text/csv",
+                    )
+                else:
+                    st.warning(f"找不到 {code} 的歷史資料，請先批次抓取後再試。")
+            except Exception as e:
+                st.error(f"技術指標計算失敗：{e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 2：即時股價
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_rt:
+    st.subheader("📡 即時股價監看")
+    st.caption("資料來源：證交所 MIS API（延遲約 20 秒）| 走勢圖：Yahoo Finance")
+
+    # ── 輸入與控制 ────────────────────────────────────────────────────────────
+    col_inp, col_ctrl = st.columns([3, 2])
+    with col_inp:
+        rt_input = st.text_input(
+            "股票代號（多支用逗號分隔）",
+            value=st.session_state.get("rt_input_val", "2330,2317,0050"),
+            placeholder="例：2330,2317,0050,3008",
+            key="rt_input_box",
+        )
+    with col_ctrl:
+        ca, cb = st.columns(2)
+        with ca:
+            rt_auto = st.toggle("自動更新", value=False, key="rt_auto")
+        with cb:
+            rt_sec  = st.selectbox("間隔(秒)", [5, 10, 30, 60], index=1, key="rt_sec")
+
+    btn_col1, btn_col2, _ = st.columns([1, 1, 5])
+    with btn_col1:
+        rt_query = st.button("🔍 查詢", type="primary", use_container_width=True, key="rt_query")
+    with btn_col2:
+        rt_stop  = st.button("⏹ 停止", use_container_width=True, key="rt_stop")
+
+    # Session state 初始化
+    if "rt_running"    not in st.session_state: st.session_state.rt_running    = False
+    if "rt_quotes"     not in st.session_state: st.session_state.rt_quotes     = []
+    if "rt_history"    not in st.session_state: st.session_state.rt_history    = {}
+    if "rt_input_val"  not in st.session_state: st.session_state.rt_input_val  = "2330,2317,0050"
+
+    if rt_query:
+        st.session_state.rt_running   = rt_auto
+        st.session_state.rt_history   = {}   # 新查詢清除走勢歷史
+        st.session_state.rt_input_val = rt_input
+
+    if rt_stop:
+        st.session_state.rt_running = False
+
+    # 解析代號
+    rt_codes = [c.strip() for c in rt_input.replace("，", ",").split(",") if c.strip()]
+
+    # ── 抓取即時報價 ──────────────────────────────────────────────────────────
+    do_fetch = rt_query or st.session_state.rt_running
+    if rt_codes and do_fetch:
+        with st.spinner("抓取即時報價…"):
+            fresh = fetch_realtime_quote(rt_codes)
+        if fresh:
+            st.session_state.rt_quotes = fresh
+            # 累積走勢歷史
+            now_ts = datetime.now().strftime("%H:%M:%S")
+            for q in fresh:
+                c = q["代號"]
+                if c not in st.session_state.rt_history:
+                    st.session_state.rt_history[c] = []
+                if q["最新價"] is not None:
+                    st.session_state.rt_history[c].append(
+                        {"時間": now_ts, "價格": q["最新價"]}
+                    )
+
+    # ── 顯示報價 ──────────────────────────────────────────────────────────────
+    quotes = st.session_state.rt_quotes
+    if quotes:
+        last_t = quotes[0].get("更新時間", "")
+        icon   = "🟢" if st.session_state.rt_running else "⚪"
+        st.caption(
+            f"{icon} 最後更新：{last_t}　"
+            f"{'🔄 自動更新中（每 ' + str(rt_sec) + ' 秒）' if st.session_state.rt_running else '手動模式'}"
+        )
+
+        # 摘要總覽表
+        rows = []
+        for q in quotes:
+            z, chg, chgp = q["最新價"], q["漲跌"], q["漲跌幅(%)"]
+            arrow = "▲" if chg and chg > 0 else ("▼" if chg and chg < 0 else "─")
+            rows.append({
+                "代號":       q["代號"],
+                "名稱":       q["名稱"],
+                "市場":       q["市場"],
+                "最新價":     f"{z:.2f}"          if z    is not None else "─",
+                "漲跌":       f"{arrow} {abs(chg):.2f}" if chg  is not None else "─",
+                "漲跌幅":     f"{chgp:+.2f}%"     if chgp is not None else "─",
+                "開盤":       f"{q['開盤']:.2f}"  if q["開盤"]  else "─",
+                "最高":       f"{q['最高']:.2f}"  if q["最高"]  else "─",
+                "最低":       f"{q['最低']:.2f}"  if q["最低"]  else "─",
+                "成交量(張)": f"{q['成交量(張)']:,}",
+                "漲停":       f"{q['漲停']:.2f}"  if q["漲停"]  else "─",
+                "跌停":       f"{q['跌停']:.2f}"  if q["跌停"]  else "─",
+            })
+
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True,
+            height=min(80 + len(quotes) * 38, 420),
+        )
+
+        # ── 個股詳細：五檔 + 走勢圖 ──────────────────────────────────────────
+        st.divider()
+        opt_list   = [f"{q['代號']}  {q['名稱']}" for q in quotes]
+        sel_label  = st.selectbox("選擇股票查看詳細資訊", opt_list, key="rt_sel")
+        sel_idx    = opt_list.index(sel_label)
+        sel_q      = quotes[sel_idx]
+        sel_code   = sel_q["代號"]
+        sel_ex     = "tse" if sel_q["市場"] == "上市" else "otc"
+
+        col_bid, col_ask, col_chart = st.columns([1, 1, 3])
+
+        with col_bid:
+            st.markdown("**📗 委買（由高→低）**")
+            bids = sel_q.get("_bids", [])
+            if bids:
+                st.dataframe(pd.DataFrame(bids), use_container_width=True,
+                             hide_index=True, height=210)
+            else:
+                st.caption("暫無委買資料")
+
+        with col_ask:
+            st.markdown("**📕 委賣（由低→高）**")
+            asks = sel_q.get("_asks", [])
+            if asks:
+                st.dataframe(pd.DataFrame(asks), use_container_width=True,
+                             hide_index=True, height=210)
+            else:
+                st.caption("暫無委賣資料")
+
+        with col_chart:
+            st.markdown(f"**📈 {sel_code} 當日走勢**")
+            history = st.session_state.rt_history.get(sel_code, [])
+
+            if len(history) >= 2:
+                # 已累積足夠即時點位 → 直接畫
+                df_hist = pd.DataFrame(history).set_index("時間")
+                st.line_chart(df_hist, use_container_width=True, height=210)
+            else:
+                # 向 Yahoo Finance 取分鐘線
+                with st.spinner(f"載入 {sel_code} 分鐘走勢…"):
+                    df_intra = fetch_intraday_chart(sel_code, sel_ex)
+                if df_intra is not None and not df_intra.empty:
+                    st.line_chart(
+                        df_intra.set_index("時間")[["收盤"]],
+                        use_container_width=True, height=210,
+                    )
+                    with st.expander("分鐘 K 線數據"):
+                        st.dataframe(df_intra, use_container_width=True,
+                                     hide_index=True, height=200)
+                else:
+                    st.caption("走勢資料暫時無法取得。開啟「自動更新」後將逐步累積即時走勢。")
+
+    elif rt_codes:
+        st.info("按「🔍 查詢」取得報價，或開啟「自動更新」持續監看。")
+    else:
+        st.info("請輸入股票代號，例如：2330,2317,0050")
+
+    # ── 自動更新計時（在 tab 底部觸發 rerun）────────────────────────────────
+    if st.session_state.rt_running:
+        time.sleep(rt_sec)
+        st.rerun()
