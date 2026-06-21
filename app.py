@@ -827,15 +827,9 @@ def check_cond_ma_support(df, tol=0.03):
     on_ma10 = cur_c > cur_m10 and abs(dist10) <= tol
     on_ma20 = cur_c > cur_m20 and abs(dist20) <= tol
 
-    passed = on_ma10 or on_ma20
+    passed = on_ma10 and on_ma20   # 兩條都要達成
 
-    # 決定顯示哪條支撐線（優先 MA10）
-    if on_ma10:
-        which_ma = "MA10"
-    elif on_ma20:
-        which_ma = "MA20"
-    else:
-        which_ma = "─"
+    which_ma = "MA10+MA20" if passed else ("MA10" if on_ma10 else ("MA20" if on_ma20 else "─"))
 
     return {
         "passed":     passed,
@@ -1517,7 +1511,7 @@ with tab_scan:
             tol_pct = st.slider("均線容忍度（%）", 1, 6, 3, key="scan_tol")
             st.markdown(
                 "<small style='color:#888'>收盤在 MA10 ± 容忍度 且站上 MA10<br>"
-                "OR 收盤在 MA20 ± 容忍度 且站上 MA20</small>",
+                "<b>AND</b> 收盤在 MA20 ± 容忍度 且站上 MA20（兩條同時達成）</small>",
                 unsafe_allow_html=True)
         else:
             tol_pct = 3
