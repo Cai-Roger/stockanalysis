@@ -1459,14 +1459,14 @@ with tab_scan:
         "1303,1326,6505,2002,1101,2207,2105,2912,2801,2880"
     )
 
-    if scan_scope == "台灣前50":
-        scope_codes = [c.strip() for c in TW50_CODES.replace("\n","").split(",") if c.strip()]
-        scope_codes = list(dict.fromkeys(scope_codes))
-        st.info(f"台灣前50成分股（共 {len(scope_codes)} 支），約 **2–5 分鐘**完成掃描。")
-        scan_input = TW50_CODES
+    # 全市場模式用到的變數，先給預設值
+    inc_twse, inc_tpex = False, False
+    stock_type = "一般股票（排除 ETF）"
+    type_map   = {"一般股票（排除 ETF）": "一般股票", "含 ETF": "含ETF", "全部": "全部"}
+    scan_input = ""
 
     if scan_scope == "自訂清單":
-        scan_input = st.text_area(
+        scan_input  = st.text_area(
             "股票代號（逗號或換行分隔）",
             value=st.session_state.get("scan_codes") or DEFAULT_CODES,
             height=90, placeholder="2330,2317,0050,3008…",
@@ -1475,18 +1475,22 @@ with tab_scan:
         scope_codes = [c.strip() for c in scan_input.replace("\n", ",").split(",") if c.strip()]
         scope_codes = list(dict.fromkeys(scope_codes))
         st.caption(f"共 {len(scope_codes)} 支")
-    else:
-        inc_twse = scan_scope in ("全市場・上市（TWSE）", "全市場・上市＋上櫃")
-        inc_tpex = scan_scope in ("全市場・上櫃（TPEx）", "全市場・上市＋上櫃")
+
+    elif scan_scope == "台灣前50":
+        scope_codes = [c.strip() for c in TW50_CODES.replace("\n", "").split(",") if c.strip()]
+        scope_codes = list(dict.fromkeys(scope_codes))
+        scan_input  = TW50_CODES
+        st.info(f"台灣前50成分股（共 {len(scope_codes)} 支），約 **2–5 分鐘**完成掃描。")
+
+    else:   # 全市場
+        inc_twse   = scan_scope in ("全市場・上市（TWSE）", "全市場・上市＋上櫃")
+        inc_tpex   = scan_scope in ("全市場・上櫃（TPEx）", "全市場・上市＋上櫃")
         stock_type = st.selectbox(
             "股票類型篩選",
             ["一般股票（排除 ETF）", "含 ETF", "全部"],
             index=0, key="scan_stock_type",
         )
-        type_map = {"一般股票（排除 ETF）": "一般股票", "含 ETF": "含ETF", "全部": "全部"}
-        scan_input = ""   # 全市場時不用文字輸入
-        scope_codes = []  # 掃描時動態抓取
-
+        scope_codes = []   # 掃描時動態從交易所抓取
         st.info(
             "⚠️ 全市場掃描將即時從證交所 / 櫃買中心抓取所有股票代號，"
             "再逐一下載歷史 K 線。\n\n"
