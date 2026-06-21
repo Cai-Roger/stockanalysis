@@ -16,6 +16,7 @@
 
 import sys
 import io
+import re
 import time
 import json
 import logging
@@ -666,11 +667,12 @@ def fetch_stock_history(code, months=4, req_delay=0.5):
     抓取單支股票近 months 個月日 K 資料。
     自動嘗試 TWSE STOCK_DAY → TPEx stk_quote_result。
     req_delay：每次請求後的休眠秒數（平行掃描時可縮短）。
-    回傳含 日期/開盤/最高/最低/收盤/成交量 的 DataFrame（時間正序）。
+    回傳 (DataFrame, 股票名稱str)。DataFrame 含 日期/開盤/最高/最低/收盤/成交量。
     """
-    frames   = []
-    exchange = None
-    today    = datetime.today()
+    frames     = []
+    exchange   = None
+    stock_name = ""
+    today      = datetime.today()
 
     for i in range(months - 1, -1, -1):
         # 計算第 i 個月前的 1 日
@@ -693,6 +695,12 @@ def fetch_stock_history(code, months=4, req_delay=0.5):
                 df = pd.DataFrame(rows, columns=fields)
                 frames.append(df)
                 exchange = exchange or "twse"
+                # 從 title 解析股票名稱，例如 "113年01月 2330 台積電  各日成交資訊"
+                if not stock_name:
+                    title = data.get("title", "")
+                    m = re.search(rf'{re.escape(code)}\s+(\S+)', title)
+                    if m:
+                        stock_name = m.group(1)
                 time.sleep(req_delay)
                 continue
 
@@ -709,6 +717,10 @@ def fetch_stock_history(code, months=4, req_delay=0.5):
                 "日期", "收盤價", "漲跌", "開盤價", "最高價", "最低價",
                 "成交量(千股)", "成交金額(千元)", "成交筆數"
             ]
+            # TPEx 名稱通常在 stkName 或 title
+            if not stock_name:
+                stock_name = (data.get("stkName") or data.get("stk_name") or
+                              data.get("title", "")).strip()
             if rows:
                 n  = min(len(rows[0]), len(fields))
                 df = pd.DataFrame(rows, columns=fields[:n])
@@ -717,14 +729,14 @@ def fetch_stock_history(code, months=4, req_delay=0.5):
         time.sleep(req_delay)
 
     if not frames:
-        return None
+        return None, stock_name
 
     df = pd.concat(frames, ignore_index=True)
 
     # ── 日期欄解析 ──────────────────────────────────────────────────────────
     date_col = next((c for c in df.columns if "日期" in c), None)
     if not date_col:
-        return None
+        return None, stock_name
 
     def _parse(d):
         d = str(d).strip()
@@ -760,7 +772,7 @@ def fetch_stock_history(code, months=4, req_delay=0.5):
             .reset_index(drop=True))
 
     keep = [c for c in ["日期", "開盤", "最高", "最低", "收盤", "成交量"] if c in df.columns]
-    return df[keep]
+    return df[keep], stock_name
 
 
 def check_cond_macd_kd(df):
@@ -803,47 +815,64 @@ def check_cond_macd_kd(df):
     }
 
 
-def check_cond_ma_support(df, tol=0.03):
+def check_cond_ma_support(df, min_vol_lot=1000):
     """
-    條件 2：站上月線（MA20）有撐
-      收盤 > MA20 且收盤在 MA20 ± tol 以內
+    條件 2：上升軌道站上月線（MA20）＋成交量篩選
+      ① MA20 向上傾斜：今日 MA20 > 5 日前 MA20
+      ② 收盤站上 MA20
+      ③ 最新成交量 ≥ min_vol_lot 張（1張=1000股）
+      三者同時成立才通過。
     """
-    if len(df) < 20:
+    if len(df) < 26:
         return {"passed": False, "reason": "資料不足"}
 
-    close   = df["收盤"].astype(float)
-    ma20    = calc_ma(close, 20)
+    close    = df["收盤"].astype(float)
+    ma20     = calc_ma(close, 20)
 
-    cur_c   = float(close.iloc[-1])
-    cur_m20 = float(ma20.iloc[-1])
-    dist20  = (cur_c - cur_m20) / cur_m20
+    cur_c    = float(close.iloc[-1])
+    cur_m20  = float(ma20.iloc[-1])
+    prev_m20 = float(ma20.iloc[-6])   # 5 個交易日前的 MA20
+    dist20   = (cur_c - cur_m20) / cur_m20
 
-    on_ma20 = cur_c > cur_m20 and abs(dist20) <= tol
+    rising   = cur_m20 > prev_m20     # ① MA20 向上傾斜
+    above    = cur_c   > cur_m20      # ② 收盤站上 MA20
+
+    # ③ 成交量（資料以「股」儲存，1張=1000股）
+    if "成交量" in df.columns:
+        cur_vol_shares = float(df["成交量"].iloc[-1])
+    else:
+        cur_vol_shares = 0.0
+    cur_vol_lot  = cur_vol_shares / 1000
+    enough_vol   = cur_vol_lot >= min_vol_lot
 
     return {
-        "passed":    on_ma20,
-        "MA20":      round(cur_m20, 2),
-        "距MA20(%)": round(dist20 * 100, 2),
-        "站MA20":    on_ma20,
+        "passed":      rising and above and enough_vol,
+        "MA20":        round(cur_m20, 2),
+        "距MA20(%)":   round(dist20 * 100, 2),
+        "成交量(張)":  int(cur_vol_lot),
+        "①MA20上升":  rising,
+        "②站MA20":    above,
+        "③量≥門檻":   enough_vol,
     }
 
 
 def scan_stock(code, use_cond1=True, use_cond2=True,
-               months=4, n_days=20, tol=0.03, req_delay=0.5):
+               months=4, n_days=20, tol=0.03, req_delay=0.5, min_vol_lot=1000):
     """掃描單一股票，回傳結果 dict（無論是否符合）。"""
-    df = fetch_stock_history(code, months=months, req_delay=req_delay)
+    df, stock_name = fetch_stock_history(code, months=months, req_delay=req_delay)
     if df is None or len(df) < 20:
-        return {"代號": code, "狀態": "❓ 無資料", "整體符合": "─"}
+        return {"代號": code, "名稱": stock_name, "狀態": "❓ 無資料", "整體符合": "─"}
 
     cur_close = float(df["收盤"].iloc[-1])
     cur_date  = df["日期"].iloc[-1]
     cur_date  = cur_date.strftime("%Y/%m/%d") if hasattr(cur_date, "strftime") else str(cur_date)
 
     result = {
-        "代號":    code,
+        "代號":     code,
+        "名稱":     stock_name,
         "最新收盤": cur_close,
         "資料日期": cur_date,
-        "狀態":    "✅ 有資料",
+        "狀態":     "✅ 有資料",
     }
 
     cond1_pass = True
@@ -865,11 +894,15 @@ def scan_stock(code, use_cond1=True, use_cond2=True,
         cond1_pass = r1.get("passed", False)
 
     if use_cond2:
-        r2 = check_cond_ma_support(df, tol=tol)
+        r2 = check_cond_ma_support(df, min_vol_lot=min_vol_lot)
         result.update({
-            "站月線":    "✅" if r2.get("passed") else "❌",
-            "MA20值":    r2.get("MA20",      "─"),
-            "距MA20(%)": r2.get("距MA20(%)", "─"),
+            "上升軌道站月線": "✅" if r2.get("passed")    else "❌",
+            "①MA20上升":     "✅" if r2.get("①MA20上升") else "❌",
+            "②站MA20":       "✅" if r2.get("②站MA20")   else "❌",
+            "③量≥門檻":      "✅" if r2.get("③量≥門檻")  else "❌",
+            "MA20值":         r2.get("MA20",       "─"),
+            "距MA20(%)":      r2.get("距MA20(%)",  "─"),
+            "成交量(張)":     r2.get("成交量(張)", "─"),
         })
         cond2_pass = r2.get("passed", False)
 
@@ -1065,18 +1098,20 @@ def render_scan_table(results, use_cond1, use_cond2):
         return f"<td>{val}</td>"
 
     # 動態表頭
-    heads = ["代號", "最新收盤", "資料日期"]
+    heads = ["代號", "名稱", "最新收盤", "資料日期"]
     if use_cond1:
         heads += ["MACD+KD", "①DIF>0", "②K>D", "③OSC轉正", "④K<50向上",
                   "DIF值", "OSC值", "K值", "D值"]
     if use_cond2:
-        heads += ["站月線", "MA20值", "距MA20(%)"]
+        heads += ["上升軌道站月線", "①MA20上升", "②站MA20", "③量≥門檻",
+                  "MA20值", "距MA20(%)", "成交量(張)"]
     heads += ["整體符合"]
 
     thead = "".join(f"<th>{h}</th>" for h in heads)
     tbody = ""
     for r in results:
         row = f"<td style='font-weight:700'>{r.get('代號','─')}</td>"
+        row += f"<td style='color:#ccc'>{r.get('名稱','')}</td>"
         row += f"<td>{r.get('最新收盤','─')}</td>"
         row += f"<td style='font-size:.78rem;color:#888'>{r.get('資料日期','─')}</td>"
         if use_cond1:
@@ -1086,8 +1121,10 @@ def render_scan_table(results, use_cond1, use_cond2):
             for k in ["DIF值","OSC值","K值","D值"]:
                 row += f"<td style='color:#aaa;font-size:.82rem'>{r.get(k,'─')}</td>"
         if use_cond2:
-            row += _td(r.get("站月線", "─"))
-            for k in ["MA20值", "距MA20(%)"]:
+            row += _td(r.get("上升軌道站月線", "─"))
+            for k in ["①MA20上升", "②站MA20", "③量≥門檻"]:
+                row += _td(r.get(k, "─"), is_sub=True)
+            for k in ["MA20值", "距MA20(%)", "成交量(張)"]:
                 row += f"<td style='color:#aaa;font-size:.82rem'>{r.get(k,'─')}</td>"
         # 整體符合
         match = r.get("整體符合", "─")
@@ -1480,15 +1517,21 @@ with tab_scan:
                 "<br>③ OSC 由負轉正 &nbsp;④ K &lt; 50 後向上</small>",
                 unsafe_allow_html=True)
 
-        use_c2 = st.checkbox("條件 2：站上月線（MA20）有撐", value=True, key="scan_c2")
+        use_c2 = st.checkbox("條件 2：上升軌道站上月線（MA20）＋成交量", value=True, key="scan_c2")
         if use_c2:
-            tol_pct = st.slider("月線容忍度（%）", 1, 6, 3, key="scan_tol")
+            min_vol = st.number_input("最低成交量（張）", min_value=0, value=1000,
+                                      step=100, key="scan_min_vol")
             st.markdown(
-                "<small style='color:#888'>收盤 &gt; MA20 且在 MA20 ± 容忍度以內</small>",
+                "<small style='color:#888'>"
+                "① MA20 向上傾斜（今日 MA20 &gt; 5日前 MA20）<br>"
+                "② 收盤站上 MA20<br>"
+                "③ 成交量 ≥ 門檻值"
+                "</small>",
                 unsafe_allow_html=True)
         else:
-            tol_pct = 3
-        n_days = 20   # 保留預設值供其他用途
+            min_vol = 1000
+        tol_pct = 3
+        n_days  = 20
 
     with param_col:
         st.markdown("**進階參數**")
@@ -1575,7 +1618,8 @@ with tab_scan:
                         use_cond1=use_c1, use_cond2=use_c2,
                         months=scan_months, n_days=n_days,
                         tol=tol_pct / 100,
-                        req_delay=0.35,   # 平行時縮短 delay
+                        req_delay=0.35,
+                        min_vol_lot=int(min_vol),
                     )
                 except Exception as e:
                     return {"代號": code, "狀態": f"❌ {e}", "整體符合": "─"}
@@ -1655,6 +1699,5 @@ with tab_scan:
         st.info(
             f"設定條件後按「▶ 開始掃描」。\n\n"
             f"目前設定：{hint_n}，預計約 {hint_t}。\n\n"
-            "**提示**：全市場掃描建議選「2 個月」＋「3 執行緒」以縮短時間；"
-            "條件 2 支撐線會自動判斷 MA10（10日線）或 MA20（月線），任一符合即通過。"
+            "**提示**：全市場掃描建議選「2 個月」＋「3 執行緒」以縮短時間。"
         )
