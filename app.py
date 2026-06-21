@@ -456,6 +456,54 @@ def fetch_all_stock_codes(include_twse=True, include_tpex=True, stock_type="一�
     return result
 
 
+def fetch_today_volume(include_twse=True, include_tpex=True):
+    """
+    一次 API 呼叫取得全市場今日（或最近交易日）成交量。
+    回傳 {股票代號: 成交量(張)} dict，用於快速初篩。
+    """
+    vol_map = {}
+
+    if include_twse:
+        try:
+            data = fetch_json(ENDPOINTS["stock_all"])
+            if data:
+                for row in data.get("data", []):
+                    if not isinstance(row, dict):
+                        continue
+                    code = str(row.get("Code", "")).strip()
+                    if not code:
+                        continue
+                    raw = str(row.get("TradeVolume", "0")).replace(",", "")
+                    try:
+                        vol_map[code] = int(raw) // 1000   # 股 → 張
+                    except (ValueError, TypeError):
+                        pass
+        except Exception as e:
+            logger.warning("fetch_today_volume TWSE 失敗：%s", e)
+
+    if include_tpex:
+        try:
+            data = fetch_json_tpex(ENDPOINTS["tpex_stock_all"])
+            if data:
+                for row in data.get("aaData", []):
+                    if not isinstance(row, dict):
+                        continue
+                    code = str(row.get("SecuritiesCompanyCode", "")).strip()
+                    if not code or code in vol_map:
+                        continue
+                    # TPEx TradeVolume 欄位單位為股
+                    raw = str(row.get("TradeVolume") or row.get("TradingShares") or "0")
+                    raw = raw.replace(",", "")
+                    try:
+                        vol_map[code] = int(raw) // 1000   # 股 → 張
+                    except (ValueError, TypeError):
+                        pass
+        except Exception as e:
+            logger.warning("fetch_today_volume TPEx 失敗：%s", e)
+
+    return vol_map
+
+
 # ─── 即時報價 ────────────────────────────────────────────────────────────────
 
 def fetch_realtime_quote(codes):
@@ -817,42 +865,47 @@ def check_cond_macd_kd(df):
 
 def check_cond_ma_support(df, min_vol_lot=1000):
     """
-    條件 2：上升軌道站上月線（MA20）＋成交量篩選
-      ① MA20 向上傾斜：今日 MA20 > 5 日前 MA20
-      ② 收盤站上 MA20
-      ③ 最新成交量 ≥ min_vol_lot 張（1張=1000股）
-      三者同時成立才通過。
+    條件 2：站上 MA20 但尚未站上 MA10 與 MA5（＋成交量門檻）
+      ① 收盤 > MA20（突破月線）
+      ② 收盤 < MA10（10日線尚未突破）
+      ③ 收盤 < MA5 （5日線尚未突破）
+      ④ 成交量 ≥ min_vol_lot 張
+      四者同時成立才通過。
     """
-    if len(df) < 26:
+    if len(df) < 21:
         return {"passed": False, "reason": "資料不足"}
 
-    close    = df["收盤"].astype(float)
-    ma20     = calc_ma(close, 20)
+    close   = df["收盤"].astype(float)
+    ma5     = calc_ma(close,  5)
+    ma10    = calc_ma(close, 10)
+    ma20    = calc_ma(close, 20)
 
-    cur_c    = float(close.iloc[-1])
-    cur_m20  = float(ma20.iloc[-1])
-    prev_m20 = float(ma20.iloc[-6])   # 5 個交易日前的 MA20
-    dist20   = (cur_c - cur_m20) / cur_m20
+    cur_c   = float(close.iloc[-1])
+    cur_m5  = float(ma5.iloc[-1])
+    cur_m10 = float(ma10.iloc[-1])
+    cur_m20 = float(ma20.iloc[-1])
+    dist20  = (cur_c - cur_m20) / cur_m20
 
-    rising   = cur_m20 > prev_m20     # ① MA20 向上傾斜
-    above    = cur_c   > cur_m20      # ② 收盤站上 MA20
+    c1 = cur_c > cur_m20   # ① 站上月線
+    c2 = cur_c < cur_m10   # ② 尚未突破 MA10
+    c3 = cur_c < cur_m5    # ③ 尚未突破 MA5
 
-    # ③ 成交量（資料以「股」儲存，1張=1000股）
-    if "成交量" in df.columns:
-        cur_vol_shares = float(df["成交量"].iloc[-1])
-    else:
-        cur_vol_shares = 0.0
-    cur_vol_lot  = cur_vol_shares / 1000
-    enough_vol   = cur_vol_lot >= min_vol_lot
+    # ④ 成交量（以「股」儲存，1張=1000股）
+    cur_vol_shares = float(df["成交量"].iloc[-1]) if "成交量" in df.columns else 0.0
+    cur_vol_lot    = cur_vol_shares / 1000
+    c4 = cur_vol_lot >= min_vol_lot
 
     return {
-        "passed":      rising and above and enough_vol,
-        "MA20":        round(cur_m20, 2),
-        "距MA20(%)":   round(dist20 * 100, 2),
-        "成交量(張)":  int(cur_vol_lot),
-        "①MA20上升":  rising,
-        "②站MA20":    above,
-        "③量≥門檻":   enough_vol,
+        "passed":     c1 and c2 and c3 and c4,
+        "MA5":        round(cur_m5,  2),
+        "MA10":       round(cur_m10, 2),
+        "MA20":       round(cur_m20, 2),
+        "距MA20(%)":  round(dist20 * 100, 2),
+        "成交量(張)": int(cur_vol_lot),
+        "①>MA20":    c1,
+        "②<MA10":    c2,
+        "③<MA5":     c3,
+        "④量≥門檻":  c4,
     }
 
 
@@ -896,13 +949,16 @@ def scan_stock(code, use_cond1=True, use_cond2=True,
     if use_cond2:
         r2 = check_cond_ma_support(df, min_vol_lot=min_vol_lot)
         result.update({
-            "上升軌道站月線": "✅" if r2.get("passed")    else "❌",
-            "①MA20上升":     "✅" if r2.get("①MA20上升") else "❌",
-            "②站MA20":       "✅" if r2.get("②站MA20")   else "❌",
-            "③量≥門檻":      "✅" if r2.get("③量≥門檻")  else "❌",
-            "MA20值":         r2.get("MA20",       "─"),
-            "距MA20(%)":      r2.get("距MA20(%)",  "─"),
-            "成交量(張)":     r2.get("成交量(張)", "─"),
+            "站MA20未破MA10/5": "✅" if r2.get("passed")  else "❌",
+            "①>MA20":           "✅" if r2.get("①>MA20")  else "❌",
+            "②<MA10":           "✅" if r2.get("②<MA10")  else "❌",
+            "③<MA5":            "✅" if r2.get("③<MA5")   else "❌",
+            "④量≥門檻":         "✅" if r2.get("④量≥門檻") else "❌",
+            "MA5值":             r2.get("MA5",        "─"),
+            "MA10值":            r2.get("MA10",       "─"),
+            "MA20值":            r2.get("MA20",       "─"),
+            "距MA20(%)":         r2.get("距MA20(%)",  "─"),
+            "成交量(張)":        r2.get("成交量(張)", "─"),
         })
         cond2_pass = r2.get("passed", False)
 
@@ -1103,8 +1159,8 @@ def render_scan_table(results, use_cond1, use_cond2):
         heads += ["MACD+KD", "①DIF>0", "②K>D", "③OSC轉正", "④K<50向上",
                   "DIF值", "OSC值", "K值", "D值"]
     if use_cond2:
-        heads += ["上升軌道站月線", "①MA20上升", "②站MA20", "③量≥門檻",
-                  "MA20值", "距MA20(%)", "成交量(張)"]
+        heads += ["站MA20未破MA10/5", "①>MA20", "②<MA10", "③<MA5", "④量≥門檻",
+                  "MA5值", "MA10值", "MA20值", "距MA20(%)", "成交量(張)"]
     heads += ["整體符合"]
 
     thead = "".join(f"<th>{h}</th>" for h in heads)
@@ -1121,10 +1177,10 @@ def render_scan_table(results, use_cond1, use_cond2):
             for k in ["DIF值","OSC值","K值","D值"]:
                 row += f"<td style='color:#aaa;font-size:.82rem'>{r.get(k,'─')}</td>"
         if use_cond2:
-            row += _td(r.get("上升軌道站月線", "─"))
-            for k in ["①MA20上升", "②站MA20", "③量≥門檻"]:
+            row += _td(r.get("站MA20未破MA10/5", "─"))
+            for k in ["①>MA20", "②<MA10", "③<MA5", "④量≥門檻"]:
                 row += _td(r.get(k, "─"), is_sub=True)
-            for k in ["MA20值", "距MA20(%)", "成交量(張)"]:
+            for k in ["MA5值", "MA10值", "MA20值", "距MA20(%)", "成交量(張)"]:
                 row += f"<td style='color:#aaa;font-size:.82rem'>{r.get(k,'─')}</td>"
         # 整體符合
         match = r.get("整體符合", "─")
@@ -1517,15 +1573,16 @@ with tab_scan:
                 "<br>③ OSC 由負轉正 &nbsp;④ K &lt; 50 後向上</small>",
                 unsafe_allow_html=True)
 
-        use_c2 = st.checkbox("條件 2：上升軌道站上月線（MA20）＋成交量", value=True, key="scan_c2")
+        use_c2 = st.checkbox("條件 2：站上 MA20 但尚未站上 MA10／MA5", value=True, key="scan_c2")
         if use_c2:
             min_vol = st.number_input("最低成交量（張）", min_value=0, value=1000,
                                       step=100, key="scan_min_vol")
             st.markdown(
                 "<small style='color:#888'>"
-                "① MA20 向上傾斜（今日 MA20 &gt; 5日前 MA20）<br>"
-                "② 收盤站上 MA20<br>"
-                "③ 成交量 ≥ 門檻值"
+                "① 收盤 &gt; MA20（突破月線）<br>"
+                "② 收盤 &lt; MA10（10日線尚未突破）<br>"
+                "③ 收盤 &lt; MA5 （5日線尚未突破）<br>"
+                "④ 成交量 ≥ 門檻值（先篩量再查技術）"
                 "</small>",
                 unsafe_allow_html=True)
         else:
@@ -1599,15 +1656,52 @@ with tab_scan:
             st.session_state.scan_results = []
             st.session_state.scan_codes   = scan_input
 
+            # ── 第一輪：成交量初篩（只需 2 次 API，速度極快）──────────────────
+            pre_vol_map    = {}
+            skipped_codes  = []
+            if use_c2 and int(min_vol) > 0:
+                fetch_twse_vol = inc_twse or scan_scope in ("自訂清單", "台灣前50")
+                fetch_tpex_vol = inc_tpex or scan_scope in ("自訂清單", "台灣前50")
+                with st.spinner(
+                    f"🔍 第一輪：抓取成交量篩選 ≥ {int(min_vol):,} 張…"
+                ):
+                    pre_vol_map = fetch_today_volume(
+                        include_twse=fetch_twse_vol,
+                        include_tpex=fetch_tpex_vol,
+                    )
+
+                if pre_vol_map:
+                    orig_count    = len(codes_to_scan)
+                    passed_codes  = [c for c in codes_to_scan
+                                     if pre_vol_map.get(c, 0) >= int(min_vol)]
+                    skipped_codes = [c for c in codes_to_scan if c not in set(passed_codes)]
+                    codes_to_scan = passed_codes
+                    st.info(
+                        f"✅ 成交量初篩完成：{orig_count} 支 → **{len(passed_codes)} 支**通過"
+                        f"（排除 {len(skipped_codes)} 支量不足）"
+                    )
+                else:
+                    st.warning("成交量資料暫時無法取得，跳過初篩直接掃描。")
+
             total      = len(codes_to_scan)
             results_buf = []
             matched     = 0
             done_count  = 0
             stop_flag   = threading.Event()
 
-            prog   = st.progress(0, text=f"掃描中：0 / {total}　符合：0")
-            status = st.status(f"正在掃描 {total} 支股票（{scan_workers} 執行緒）…",
-                               expanded=True)
+            # 量不足的股票直接標記為不符合，不再抓歷史資料
+            for c in skipped_codes:
+                results_buf.append({
+                    "代號": c, "名稱": "", "狀態": "⏭ 量不足（跳過）",
+                    "整體符合": "❌ 不符",
+                    "上升軌道站月線": "❌", "③量≥門檻": "❌",
+                })
+
+            prog   = st.progress(0, text=f"第二輪：0 / {total}　符合：0")
+            status = st.status(
+                f"第二輪：對 {total} 支進行技術分析（{scan_workers} 執行緒）…",
+                expanded=True,
+            )
 
             def _worker(code):
                 if stop_flag.is_set():
@@ -1657,12 +1751,15 @@ with tab_scan:
     if results:
         matched_list = [r for r in results if r.get("整體符合") == "✅ 符合"]
 
+        skipped_n  = sum(1 for r in results if r.get("狀態", "").startswith("⏭"))
+        analyzed_n = len(results) - skipped_n
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("掃描股票數",  len(results))
+        m1.metric("總掃描數",    len(results),
+                  delta=f"初篩排除 {skipped_n} 支" if skipped_n else None)
         m2.metric("✅ 符合條件", len(matched_list))
-        m3.metric("❌ 不符合",   len(results) - len(matched_list))
-        hit_rate = len(matched_list) / len(results) * 100 if results else 0
-        m4.metric("命中率", f"{hit_rate:.1f}%")
+        m3.metric("❌ 不符合",   len(results) - len(matched_list) - skipped_n)
+        hit_rate = len(matched_list) / analyzed_n * 100 if analyzed_n else 0
+        m4.metric("命中率（分析中）", f"{hit_rate:.1f}%")
 
         st.divider()
 
