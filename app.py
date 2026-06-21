@@ -19,11 +19,13 @@ import io
 import time
 import json
 import logging
+import threading
 import requests
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta, date as date_cls
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ─── 設定區 ──────────────────────────────────────────────────────────────────
@@ -404,6 +406,55 @@ def fetch_tpex_margin(date_str):
     return df
 
 
+# ─── 全市場股票代號 ──────────────────────────────────────────────────────────
+
+def fetch_all_stock_codes(include_twse=True, include_tpex=True, stock_type="一般股票"):
+    """
+    一次抓取全市場所有股票代號。
+    stock_type:
+      "一般股票" → 4 碼數字，排除 ETF（00xxxx）
+      "含ETF"    → 4~6 碼數字（含 ETF、指數型基金）
+      "全部"     → 不過濾
+    回傳 list[str]，去重、保序。
+    """
+    result, seen = [], set()
+
+    def _add(code):
+        code = str(code).strip()
+        if code in seen:
+            return
+        if stock_type == "一般股票":
+            if not (code.isdigit() and len(code) == 4 and not code.startswith("00")):
+                return
+        elif stock_type == "含ETF":
+            if not (code.isdigit() and 4 <= len(code) <= 6):
+                return
+        seen.add(code)
+        result.append(code)
+
+    if include_twse:
+        try:
+            data = fetch_json(ENDPOINTS["stock_all"])
+            if data:
+                for row in data.get("data", []):
+                    if isinstance(row, dict):
+                        _add(row.get("Code", ""))
+        except Exception as e:
+            logger.warning("取得上市代號失敗：%s", e)
+
+    if include_tpex:
+        try:
+            data = fetch_json_tpex(ENDPOINTS["tpex_stock_all"])
+            if data:
+                for row in data.get("aaData", []):
+                    if isinstance(row, dict):
+                        _add(row.get("SecuritiesCompanyCode", ""))
+        except Exception as e:
+            logger.warning("取得上櫃代號失敗：%s", e)
+
+    return result
+
+
 # ─── 即時報價 ────────────────────────────────────────────────────────────────
 
 def fetch_realtime_quote(codes):
@@ -610,10 +661,11 @@ def merge_stock_data(stock_no):
 
 # ─── 選股掃描 ─────────────────────────────────────────────────────────────────
 
-def fetch_stock_history(code, months=4):
+def fetch_stock_history(code, months=4, req_delay=0.5):
     """
     抓取單支股票近 months 個月日 K 資料。
     自動嘗試 TWSE STOCK_DAY → TPEx stk_quote_result。
+    req_delay：每次請求後的休眠秒數（平行掃描時可縮短）。
     回傳含 日期/開盤/最高/最低/收盤/成交量 的 DataFrame（時間正序）。
     """
     frames   = []
@@ -641,7 +693,7 @@ def fetch_stock_history(code, months=4):
                 df = pd.DataFrame(rows, columns=fields)
                 frames.append(df)
                 exchange = exchange or "twse"
-                time.sleep(0.6)
+                time.sleep(req_delay)
                 continue
 
         # ── TPEx ────────────────────────────────────────────────────────────
@@ -662,7 +714,7 @@ def fetch_stock_history(code, months=4):
                 df = pd.DataFrame(rows, columns=fields[:n])
                 frames.append(df)
                 exchange = exchange or "tpex"
-        time.sleep(0.6)
+        time.sleep(req_delay)
 
     if not frames:
         return None
@@ -803,9 +855,9 @@ def check_cond_high_pullback(df, n_days=20, tol=0.03):
 
 
 def scan_stock(code, use_cond1=True, use_cond2=True,
-               months=4, n_days=20, tol=0.03):
+               months=4, n_days=20, tol=0.03, req_delay=0.5):
     """掃描單一股票，回傳結果 dict（無論是否符合）。"""
-    df = fetch_stock_history(code, months=months)
+    df = fetch_stock_history(code, months=months, req_delay=req_delay)
     if df is None or len(df) < 20:
         return {"代號": code, "狀態": "❓ 無資料", "整體符合": "─"}
 
@@ -1374,143 +1426,227 @@ with tab_rt:
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_scan:
     st.subheader("🔍 技術面選股掃描")
-    st.caption("即時抓取個股歷史 K 線，計算技術指標後自動篩選符合條件的股票")
+    st.caption("支援自訂清單或一鍵掃描全市場上市 / 上櫃，多執行緒平行抓取")
 
-    # ── 控制面板 ──────────────────────────────────────────────────────────────
-    ctrl_l, ctrl_r = st.columns([2, 1])
+    # ── Session state 初始化 ──────────────────────────────────────────────────
+    for _k, _v in [("scan_running", False), ("scan_results", []),
+                   ("scan_codes", ""), ("scan_mode", "自訂清單"),
+                   ("scan_fetched_codes", [])]:
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
 
-    with ctrl_l:
-        # 預設台灣50 + 中型100部分成分股
-        DEFAULT_CODES = (
-            "2330,2317,2454,2382,2308,3711,2303,3034,2357,2379,"
-            "2395,2881,2882,2886,2891,2892,5880,2884,2885,1301,"
-            "1303,1326,6505,2002,1101,2207,2105,2912,2801,2880"
+    # ── 掃描範圍 ──────────────────────────────────────────────────────────────
+    st.markdown("#### 掃描範圍")
+    scope_col, _ = st.columns([3, 1])
+    with scope_col:
+        scan_scope = st.radio(
+            "掃描範圍",
+            ["自訂清單", "全市場・上市（TWSE）", "全市場・上櫃（TPEx）", "全市場・上市＋上櫃"],
+            index=0, horizontal=True, label_visibility="collapsed",
+            key="scan_scope",
         )
+
+    DEFAULT_CODES = (
+        "2330,2317,2454,2382,2308,3711,2303,3034,2357,2379,"
+        "2395,2881,2882,2886,2891,2892,5880,2884,2885,1301,"
+        "1303,1326,6505,2002,1101,2207,2105,2912,2801,2880"
+    )
+
+    if scan_scope == "自訂清單":
         scan_input = st.text_area(
             "股票代號（逗號或換行分隔）",
-            value=st.session_state.get("scan_codes", DEFAULT_CODES),
-            height=100,
-            placeholder="2330,2317,0050,3008…",
+            value=st.session_state.get("scan_codes") or DEFAULT_CODES,
+            height=90, placeholder="2330,2317,0050,3008…",
             key="scan_input_box",
         )
+        scope_codes = [c.strip() for c in scan_input.replace("\n", ",").split(",") if c.strip()]
+        scope_codes = list(dict.fromkeys(scope_codes))
+        st.caption(f"共 {len(scope_codes)} 支")
+    else:
+        inc_twse = scan_scope in ("全市場・上市（TWSE）", "全市場・上市＋上櫃")
+        inc_tpex = scan_scope in ("全市場・上櫃（TPEx）", "全市場・上市＋上櫃")
+        stock_type = st.selectbox(
+            "股票類型篩選",
+            ["一般股票（排除 ETF）", "含 ETF", "全部"],
+            index=0, key="scan_stock_type",
+        )
+        type_map = {"一般股票（排除 ETF）": "一般股票", "含 ETF": "含ETF", "全部": "全部"}
+        scan_input = ""   # 全市場時不用文字輸入
+        scope_codes = []  # 掃描時動態抓取
 
-        col_m, col_q = st.columns(2)
-        with col_m:
-            scan_months = st.slider("抓取月數（計算指標用）", 3, 6, 4)
-        with col_q:
-            scan_match = st.radio("篩選結果", ["只顯示符合", "全部顯示"], index=0, horizontal=True)
-
-    with ctrl_r:
-        st.markdown("**條件 1：MACD + KD 糾結向上**")
-        use_c1 = st.checkbox("啟用條件 1", value=True, key="scan_c1")
-        if use_c1:
-            st.markdown(
-                "<small style='color:#888'>"
-                "① DIF > 0　② K > D（黃金交叉）<br>"
-                "③ OSC 由負轉正　④ K < 50 後向上"
-                "</small>",
-                unsafe_allow_html=True,
-            )
-
-        st.markdown("**條件 2：創高後回測月線有撐**")
-        use_c2 = st.checkbox("啟用條件 2", value=True, key="scan_c2")
-        if use_c2:
-            n_days  = st.slider("創高觀察期（天）", 10, 40, 20, key="scan_ndays")
-            tol_pct = st.slider("月線容忍度（%）", 1, 6, 3, key="scan_tol")
-        else:
-            n_days, tol_pct = 20, 3
+        st.info(
+            "⚠️ 全市場掃描將即時從證交所 / 櫃買中心抓取所有股票代號，"
+            "再逐一下載歷史 K 線。\n\n"
+            "上市約 900 支、上櫃約 700 支。建議選「**2 個月**」加「**3 執行緒**」，"
+            "約 **25–40 分鐘**完成。請確保網路穩定。"
+        )
 
     st.divider()
 
-    # ── 開始掃描 ──────────────────────────────────────────────────────────────
-    sc1, sc2, sc3, _ = st.columns([1, 1, 1, 4])
-    with sc1:
-        scan_btn  = st.button("▶ 開始掃描", type="primary", use_container_width=True, key="scan_start")
-    with sc2:
-        scan_stop = st.button("⏹ 停止",   use_container_width=True, key="scan_stop")
-    with sc3:
-        scan_clear = st.button("🗑 清除結果", use_container_width=True, key="scan_clear")
+    # ── 條件設定 + 進階參數 ───────────────────────────────────────────────────
+    cond_col, param_col = st.columns([1, 1])
 
-    if "scan_running" not in st.session_state: st.session_state.scan_running = False
-    if "scan_results" not in st.session_state: st.session_state.scan_results = []
+    with cond_col:
+        st.markdown("**篩選條件**")
+        use_c1 = st.checkbox("條件 1：MACD + KD 糾結向上", value=True, key="scan_c1")
+        if use_c1:
+            st.markdown(
+                "<small style='color:#888'>① DIF > 0 &nbsp;② K > D（黃金交叉）"
+                "<br>③ OSC 由負轉正 &nbsp;④ K &lt; 50 後向上</small>",
+                unsafe_allow_html=True)
 
-    if scan_stop:
-        st.session_state.scan_running = False
+        use_c2 = st.checkbox("條件 2：創高後回測月線有撐", value=True, key="scan_c2")
+        if use_c2:
+            n_days  = st.slider("創高觀察期（天）", 10, 40, 20, key="scan_ndays")
+            tol_pct = st.slider("月線容忍度（%）",   1,  6,  3, key="scan_tol")
+        else:
+            n_days, tol_pct = 20, 3
+
+    with param_col:
+        st.markdown("**進階參數**")
+        scan_months  = st.slider("抓取月數（建議全市場選 2）", 2, 6, 3, key="scan_months")
+        scan_workers = st.slider("平行執行緒數",              1, 8, 3, key="scan_workers")
+        scan_match   = st.radio("結果顯示", ["只顯示符合", "全部顯示"],
+                                index=0, horizontal=True, key="scan_match")
+
+        # 預估時間
+        if scan_scope == "自訂清單":
+            est_n = len(scope_codes) if scope_codes else 0
+        else:
+            est_n = 900 if inc_twse and not inc_tpex else (
+                    700 if inc_tpex and not inc_twse else 1600)
+        if est_n > 0:
+            secs_per = scan_months * 0.5    # 每支股票約 0.5s × 月數
+            est_min  = est_n * secs_per / scan_workers / 60
+            st.markdown(
+                f"<small style='color:#aaa'>預估時間：{est_n} 支 ÷ {scan_workers} 執行緒 "
+                f"× {scan_months} 月 ≈ <b style='color:#e8a838'>{est_min:.0f} 分鐘</b></small>",
+                unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── 按鈕列 ────────────────────────────────────────────────────────────────
+    b1, b2, b3, _ = st.columns([1, 1, 1, 4])
+    with b1:
+        scan_btn   = st.button("▶ 開始掃描", type="primary",
+                               use_container_width=True, key="scan_start")
+    with b2:
+        scan_stop  = st.button("⏹ 停止",    use_container_width=True, key="scan_stop")
+    with b3:
+        scan_clear = st.button("🗑 清除",    use_container_width=True, key="scan_clear")
+
+    if scan_stop:  st.session_state.scan_running = False
     if scan_clear:
         st.session_state.scan_results = []
         st.session_state.scan_running = False
+        st.session_state.scan_fetched_codes = []
 
+    # ── 掃描執行 ──────────────────────────────────────────────────────────────
     if scan_btn:
-        codes = [c.strip() for c in scan_input.replace("\n", ",").split(",") if c.strip()]
-        codes = list(dict.fromkeys(codes))    # 去重保序
-
-        if not codes:
-            st.warning("請先輸入股票代號")
-        elif not use_c1 and not use_c2:
+        if not use_c1 and not use_c2:
             st.warning("請至少啟用一個篩選條件")
         else:
+            # 1. 取得代號清單
+            if scan_scope == "自訂清單":
+                codes_to_scan = scope_codes
+                if not codes_to_scan:
+                    st.warning("請先輸入股票代號")
+                    st.stop()
+            else:
+                with st.spinner("正在從交易所抓取所有股票代號…"):
+                    codes_to_scan = fetch_all_stock_codes(
+                        include_twse=inc_twse,
+                        include_tpex=inc_tpex,
+                        stock_type=type_map[stock_type],
+                    )
+                if not codes_to_scan:
+                    st.error("無法取得股票代號，請稍後再試")
+                    st.stop()
+                st.session_state.scan_fetched_codes = codes_to_scan
+
             st.session_state.scan_running = True
             st.session_state.scan_results = []
             st.session_state.scan_codes   = scan_input
 
-            total   = len(codes)
-            prog    = st.progress(0, text=f"掃描中：0 / {total}")
-            status  = st.status(f"正在掃描 {total} 支股票…", expanded=True)
-            matched = 0
+            total      = len(codes_to_scan)
+            results_buf = []
+            matched     = 0
+            done_count  = 0
+            stop_flag   = threading.Event()
 
-            for i, code in enumerate(codes):
-                if not st.session_state.scan_running:
-                    status.write("⏹ 使用者停止掃描")
-                    break
+            prog   = st.progress(0, text=f"掃描中：0 / {total}　符合：0")
+            status = st.status(f"正在掃描 {total} 支股票（{scan_workers} 執行緒）…",
+                               expanded=True)
 
-                prog.progress((i + 1) / total, text=f"掃描中：{i+1} / {total}　{code}")
-                status.write(f"⏳ 抓取 {code}…")
-
+            def _worker(code):
+                if stop_flag.is_set():
+                    return {"代號": code, "狀態": "⏹ 已停止", "整體符合": "─"}
                 try:
-                    r = scan_stock(
+                    return scan_stock(
                         code,
-                        use_cond1=use_c1,
-                        use_cond2=use_c2,
-                        months=scan_months,
-                        n_days=n_days,
+                        use_cond1=use_c1, use_cond2=use_c2,
+                        months=scan_months, n_days=n_days,
                         tol=tol_pct / 100,
+                        req_delay=0.35,   # 平行時縮短 delay
                     )
                 except Exception as e:
-                    r = {"代號": code, "狀態": f"❌ 錯誤：{e}", "整體符合": "─"}
+                    return {"代號": code, "狀態": f"❌ {e}", "整體符合": "─"}
 
-                st.session_state.scan_results.append(r)
-                if r.get("整體符合") == "✅ 符合":
-                    matched += 1
-                    status.write(f"✅ {code} 符合！（目前 {matched} 支）")
+            with ThreadPoolExecutor(max_workers=scan_workers) as exe:
+                futures = {exe.submit(_worker, c): c for c in codes_to_scan}
+                for fut in as_completed(futures):
+                    if not st.session_state.scan_running:
+                        stop_flag.set()
+                        status.write("⏹ 使用者停止掃描")
+                        break
+                    done_count += 1
+                    r = fut.result()
+                    results_buf.append(r)
+                    if r.get("整體符合") == "✅ 符合":
+                        matched += 1
+                        status.write(f"✅ {r['代號']} 符合！（目前 {matched} 支）")
+                    prog.progress(
+                        done_count / total,
+                        text=f"掃描中：{done_count} / {total}　符合：{matched}",
+                    )
 
-            prog.progress(1.0, text=f"掃描完成：{total} 支，符合 {matched} 支")
-            status.update(label=f"掃描完成：{total} 支，符合 {matched} 支", state="complete")
-            st.session_state.scan_running = False
+            # 依輸入順序排序結果
+            code_order = {c: i for i, c in enumerate(codes_to_scan)}
+            results_buf.sort(key=lambda r: code_order.get(r.get("代號", ""), 9999))
+
+            st.session_state.scan_results  = results_buf
+            st.session_state.scan_running  = False
+            prog.progress(1.0, text=f"掃描完成：{done_count} 支，符合 {matched} 支")
+            status.update(label=f"掃描完成：{done_count} 支，符合 {matched} 支",
+                          state="complete")
 
     # ── 顯示結果 ──────────────────────────────────────────────────────────────
     results = st.session_state.scan_results
     if results:
         matched_list = [r for r in results if r.get("整體符合") == "✅ 符合"]
-        total_list   = results
 
-        # 統計摘要
-        m1, m2, m3 = st.columns(3)
-        m1.metric("掃描股票數",   len(total_list))
-        m2.metric("符合條件",     len(matched_list), delta=f"{len(matched_list)/len(total_list)*100:.1f}%")
-        m3.metric("不符合",       len(total_list) - len(matched_list))
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("掃描股票數",  len(results))
+        m2.metric("✅ 符合條件", len(matched_list))
+        m3.metric("❌ 不符合",   len(results) - len(matched_list))
+        hit_rate = len(matched_list) / len(results) * 100 if results else 0
+        m4.metric("命中率", f"{hit_rate:.1f}%")
 
         st.divider()
 
-        # 切換顯示範圍
-        display = matched_list if scan_match == "只顯示符合" else total_list
+        display = matched_list if scan_match == "只顯示符合" else results
 
         if display:
-            st.markdown(render_scan_table(display, use_c1, use_c2),
+            # 符合的先、再不符，方便瀏覽
+            display_sorted = (
+                sorted(display, key=lambda r: 0 if r.get("整體符合") == "✅ 符合" else 1)
+                if scan_match == "全部顯示" else display
+            )
+            st.markdown(render_scan_table(display_sorted, use_c1, use_c2),
                         unsafe_allow_html=True)
 
-            # 下載 CSV
             df_dl = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")}
-                                   for r in display])
+                                   for r in display_sorted])
             st.download_button(
                 "⬇ 下載掃描結果 CSV",
                 data=df_to_csv_bytes(df_dl),
@@ -1521,6 +1657,14 @@ with tab_scan:
         else:
             st.info("目前沒有符合條件的股票，可嘗試放寬篩選參數或選擇「全部顯示」。")
     else:
-        st.info("設定條件後按「▶ 開始掃描」。\n\n"
-                "**提示**：每支股票需抓取約 4 個月歷史資料（每月一次 API 請求），"
-                "掃描 30 支約需 1–2 分鐘，請耐心等待。")
+        if scan_scope == "自訂清單":
+            hint_n = f"**{len(scope_codes)} 支**"
+            hint_t = f"約 {len(scope_codes) * scan_months * 0.5 / scan_workers / 60:.1f} 分鐘"
+        else:
+            hint_n = "全市場（上市＋上櫃約 1600 支）"
+            hint_t = "25–40 分鐘（視執行緒數與月數而定）"
+        st.info(
+            f"設定條件後按「▶ 開始掃描」。\n\n"
+            f"目前設定：{hint_n}，預計 {hint_t}。\n\n"
+            "**提示**：全市場掃描建議選「2 個月」+ 「3 執行緒」以縮短時間。"
+        )
