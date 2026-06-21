@@ -803,29 +803,19 @@ def check_cond_macd_kd(df):
     }
 
 
-def check_cond_high_pullback(df, n_days=20, tol=0.03):
+def check_cond_ma_support(df, tol=0.03):
     """
-    條件 2：創高後回測均線有撐（MA10 或 MA20 任一符合即通過）
-      ① 近 n_days 天內曾創 60 日新高
-      ② 目前收盤在 MA10 ± tol 以內  OR  在 MA20 ± tol 以內
-      ③ 收盤 > 所回測的均線（守住支撐）
-      ④ 今日成交量 < 5 日均量（縮量健康回調）
+    條件 2：站上均線有撐（MA10 或 MA20 任一符合即通過）
+      收盤在 MA10 ± tol 以內且 > MA10
+      OR
+      收盤在 MA20 ± tol 以內且 > MA20
     """
-    if len(df) < 60:
+    if len(df) < 20:
         return {"passed": False, "reason": "資料不足"}
 
-    close = df["收盤"].astype(float)
-    high  = df["最高"].astype(float) if "最高" in df.columns else close
-    vol   = df["成交量"].astype(float) if "成交量" in df.columns else pd.Series([1.0] * len(df))
-
-    ma10 = calc_ma(close, 10)
-    ma20 = calc_ma(close, 20)
-    ma5v = vol.rolling(5, min_periods=1).mean()
-
-    # 創 60 日新高（用前一天的 59 日最高做比較）
-    prev_59 = high.shift(1).rolling(59, min_periods=20).max()
-    new_h   = high > prev_59
-    c1 = bool(new_h.iloc[-n_days:].any())
+    close   = df["收盤"].astype(float)
+    ma10    = calc_ma(close, 10)
+    ma20    = calc_ma(close, 20)
 
     cur_c   = float(close.iloc[-1])
     cur_m10 = float(ma10.iloc[-1])
@@ -833,45 +823,29 @@ def check_cond_high_pullback(df, n_days=20, tol=0.03):
     dist10  = (cur_c - cur_m10) / cur_m10
     dist20  = (cur_c - cur_m20) / cur_m20
 
-    near10  = abs(dist10) <= tol and cur_c > cur_m10   # 在 MA10 上方 ±tol
-    near20  = abs(dist20) <= tol and cur_c > cur_m20   # 在 MA20 上方 ±tol
+    # 站在均線上方且距離在容忍度內
+    on_ma10 = cur_c > cur_m10 and abs(dist10) <= tol
+    on_ma20 = cur_c > cur_m20 and abs(dist20) <= tol
 
-    c2 = near10 or near20          # 在任一均線附近
-    c3 = cur_c > cur_m10 or cur_c > cur_m20  # 守住至少一條均線
-    c4 = bool(float(vol.iloc[-1]) < float(ma5v.iloc[-1]))
+    passed = on_ma10 or on_ma20
 
-    # 決定主要支撐線（優先 MA10，因為更近期）
-    if near10:
-        which_ma, dist_show, ma_val = "MA10", dist10, cur_m10
-    elif near20:
-        which_ma, dist_show, ma_val = "MA20", dist20, cur_m20
+    # 決定顯示哪條支撐線（優先 MA10）
+    if on_ma10:
+        which_ma = "MA10"
+    elif on_ma20:
+        which_ma = "MA20"
     else:
-        # 未符合時顯示距離最近的那條
-        if abs(dist10) <= abs(dist20):
-            which_ma, dist_show, ma_val = "MA10", dist10, cur_m10
-        else:
-            which_ma, dist_show, ma_val = "MA20", dist20, cur_m20
-
-    # 最後創高日期
-    last_new_high = "無"
-    if c1:
-        idx_arr = np.where(new_h.iloc[-n_days:].values)[0]
-        if len(idx_arr):
-            row_idx = len(df) - n_days + idx_arr[-1]
-            d = df["日期"].iloc[row_idx]
-            last_new_high = d.strftime("%Y/%m/%d") if hasattr(d, "strftime") else str(d)
+        which_ma = "─"
 
     return {
-        "passed":        c1 and c2 and c3 and c4,
-        "支撐線":        which_ma,
-        "MA10":          round(cur_m10, 2),
-        "MA20":          round(cur_m20, 2),
-        "距支撐(%)":     round(dist_show * 100, 2),
-        "最近創高日":    last_new_high,
-        "①近創60日高":  c1,
-        "②在均線±tol":  c2,
-        "③收>均線":      c3,
-        "④縮量回調":     c4,
+        "passed":     passed,
+        "支撐線":     which_ma,
+        "MA10":       round(cur_m10, 2),
+        "MA20":       round(cur_m20, 2),
+        "距MA10(%)":  round(dist10 * 100, 2),
+        "距MA20(%)":  round(dist20 * 100, 2),
+        "站MA10":     on_ma10,
+        "站MA20":     on_ma20,
     }
 
 
@@ -912,18 +886,16 @@ def scan_stock(code, use_cond1=True, use_cond2=True,
         cond1_pass = r1.get("passed", False)
 
     if use_cond2:
-        r2 = check_cond_high_pullback(df, n_days=n_days, tol=tol)
+        r2 = check_cond_ma_support(df, tol=tol)
         result.update({
-            "創高回均線":  "✅" if r2.get("passed") else "❌",
-            "支撐線":      r2.get("支撐線", "─"),
-            "①創60日高":  "✅" if r2.get("①近創60日高") else "❌",
-            "②在均線±%":  "✅" if r2.get("②在均線±tol") else "❌",
-            "③收>均線":   "✅" if r2.get("③收>均線")    else "❌",
-            "④縮量":       "✅" if r2.get("④縮量回調")   else "❌",
-            "MA10值":      r2.get("MA10",       "─"),
-            "MA20值":      r2.get("MA20",       "─"),
-            "距支撐(%)":   r2.get("距支撐(%)",  "─"),
-            "最近創高日":  r2.get("最近創高日",  "─"),
+            "均線有撐":   "✅" if r2.get("passed") else "❌",
+            "支撐線":     r2.get("支撐線", "─"),
+            "站MA10":     "✅" if r2.get("站MA10") else "❌",
+            "站MA20":     "✅" if r2.get("站MA20") else "❌",
+            "MA10值":     r2.get("MA10",      "─"),
+            "MA20值":     r2.get("MA20",      "─"),
+            "距MA10(%)":  r2.get("距MA10(%)", "─"),
+            "距MA20(%)":  r2.get("距MA20(%)", "─"),
         })
         cond2_pass = r2.get("passed", False)
 
@@ -1124,8 +1096,8 @@ def render_scan_table(results, use_cond1, use_cond2):
         heads += ["MACD+KD", "①DIF>0", "②K>D", "③OSC轉正", "④K<50向上",
                   "DIF值", "OSC值", "K值", "D值"]
     if use_cond2:
-        heads += ["創高回均線", "支撐線", "①創60日高", "②在均線±%", "③收>均線", "④縮量",
-                  "MA10值", "MA20值", "距支撐(%)", "最近創高日"]
+        heads += ["均線有撐", "支撐線", "站MA10", "站MA20",
+                  "MA10值", "MA20值", "距MA10(%)", "距MA20(%)"]
     heads += ["整體符合"]
 
     thead = "".join(f"<th>{h}</th>" for h in heads)
@@ -1141,14 +1113,13 @@ def render_scan_table(results, use_cond1, use_cond2):
             for k in ["DIF值","OSC值","K值","D值"]:
                 row += f"<td style='color:#aaa;font-size:.82rem'>{r.get(k,'─')}</td>"
         if use_cond2:
-            row += _td(r.get("創高回均線", "─"))
-            # 支撐線標色
+            row += _td(r.get("均線有撐", "─"))
             ma_lbl = r.get("支撐線", "─")
-            ma_color = "#e8a838" if ma_lbl == "MA10" else "#7ab8f5" if ma_lbl == "MA20" else "#666"
-            row += f"<td style='color:{ma_color};font-weight:700;font-size:.82rem'>{ma_lbl}</td>"
-            for k in ["①創60日高","②在均線±%","③收>均線","④縮量"]:
+            ma_color = "#e8a838" if ma_lbl == "MA10" else "#7ab8f5" if ma_lbl == "MA20" else "#555"
+            row += f"<td style='color:{ma_color};font-weight:700;font-size:.88rem'>{ma_lbl}</td>"
+            for k in ["站MA10", "站MA20"]:
                 row += _td(r.get(k, "─"), is_sub=True)
-            for k in ["MA10值","MA20值","距支撐(%)","最近創高日"]:
+            for k in ["MA10值", "MA20值", "距MA10(%)", "距MA20(%)"]:
                 row += f"<td style='color:#aaa;font-size:.82rem'>{r.get(k,'─')}</td>"
         # 整體符合
         match = r.get("整體符合", "─")
@@ -1537,12 +1508,16 @@ with tab_scan:
                 "<br>③ OSC 由負轉正 &nbsp;④ K &lt; 50 後向上</small>",
                 unsafe_allow_html=True)
 
-        use_c2 = st.checkbox("條件 2：創高後回測均線有撐（MA10 / MA20）", value=True, key="scan_c2")
+        use_c2 = st.checkbox("條件 2：站上均線有撐（MA10 或 MA20）", value=True, key="scan_c2")
         if use_c2:
-            n_days  = st.slider("創高觀察期（天）", 10, 40, 20, key="scan_ndays")
-            tol_pct = st.slider("月線容忍度（%）",   1,  6,  3, key="scan_tol")
+            tol_pct = st.slider("均線容忍度（%）", 1, 6, 3, key="scan_tol")
+            st.markdown(
+                "<small style='color:#888'>收盤在 MA10 ± 容忍度 且站上 MA10<br>"
+                "OR 收盤在 MA20 ± 容忍度 且站上 MA20</small>",
+                unsafe_allow_html=True)
         else:
-            n_days, tol_pct = 20, 3
+            tol_pct = 3
+        n_days = 20   # 保留預設值供其他用途
 
     with param_col:
         st.markdown("**進階參數**")
