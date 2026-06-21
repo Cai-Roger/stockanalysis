@@ -863,54 +863,67 @@ def check_cond_macd_kd(df):
     }
 
 
-def check_cond_ma_support(df, min_vol_lot=1000):
+def check_cond_ma_support(df, n_days=20, tol=0.03, min_vol_lot=1000):
     """
-    條件 2：站上 MA20 但尚未站上 MA10 與 MA5（＋成交量門檻）
-      ① 收盤 > MA20（突破月線）
-      ② 收盤 < MA10（10日線尚未突破）
-      ③ 收盤 < MA5 （5日線尚未突破）
+    條件 2：股價過前高後走低，收盤回到 MA20 附近
+      ① 近 n_days 天內曾出現 60 日新高（突破前高）
+      ② 目前收盤 < 近 n_days 天最高收盤（已從高點回落）
+      ③ 收盤在 MA20 ± tol 以內且 > MA20（月線附近有撐）
       ④ 成交量 ≥ min_vol_lot 張
-      四者同時成立才通過。
     """
-    if len(df) < 21:
-        return {"passed": False, "reason": "資料不足"}
+    if len(df) < 61:
+        return {"passed": False, "reason": "資料不足（需至少 61 根 K 棒）"}
 
-    close   = df["收盤"].astype(float)
-    ma5     = calc_ma(close,  5)
-    ma10    = calc_ma(close, 10)
-    ma20    = calc_ma(close, 20)
+    close  = df["收盤"].astype(float)
+    high   = df["最高"].astype(float) if "最高" in df.columns else close
+    ma20   = calc_ma(close, 20)
 
     cur_c   = float(close.iloc[-1])
-    cur_m5  = float(ma5.iloc[-1])
-    cur_m10 = float(ma10.iloc[-1])
     cur_m20 = float(ma20.iloc[-1])
     dist20  = (cur_c - cur_m20) / cur_m20
 
-    c1 = cur_c > cur_m20   # ① 站上月線
-    c2 = cur_c < cur_m10   # ② 尚未突破 MA10
-    c3 = cur_c < cur_m5    # ③ 尚未突破 MA5
+    # ① 近 n_days 天內曾創 60 日新高
+    prev_59    = high.shift(1).rolling(59, min_periods=20).max()
+    broke_high = high > prev_59                              # 當天有創新高
+    c1 = bool(broke_high.iloc[-n_days:].any())
 
-    # ④ 成交量（以「股」儲存，1張=1000股）
+    # ② 已從近期高點回落（當天收盤 < 近 n_days 最高收盤）
+    recent_high_close = float(close.iloc[-n_days:].max())
+    c2 = cur_c < recent_high_close
+
+    # ③ 收盤在 MA20 ± tol 且站上 MA20
+    c3 = (cur_c > cur_m20) and (abs(dist20) <= tol)
+
+    # ④ 成交量
     cur_vol_shares = float(df["成交量"].iloc[-1]) if "成交量" in df.columns else 0.0
     cur_vol_lot    = cur_vol_shares / 1000
     c4 = cur_vol_lot >= min_vol_lot
 
+    # 最近創高日
+    last_high_date = "─"
+    if c1:
+        idx_arr = np.where(broke_high.iloc[-n_days:].values)[0]
+        if len(idx_arr):
+            row_idx = len(df) - n_days + idx_arr[-1]
+            d = df["日期"].iloc[row_idx]
+            last_high_date = d.strftime("%m/%d") if hasattr(d, "strftime") else str(d)
+
     return {
-        "passed":     c1 and c2 and c3 and c4,
-        "MA5":        round(cur_m5,  2),
-        "MA10":       round(cur_m10, 2),
-        "MA20":       round(cur_m20, 2),
-        "距MA20(%)":  round(dist20 * 100, 2),
-        "成交量(張)": int(cur_vol_lot),
-        "①>MA20":    c1,
-        "②<MA10":    c2,
-        "③<MA5":     c3,
-        "④量≥門檻":  c4,
+        "passed":      c1 and c2 and c3 and c4,
+        "MA20":        round(cur_m20, 2),
+        "距MA20(%)":   round(dist20 * 100, 2),
+        "成交量(張)":  int(cur_vol_lot),
+        "近期高點":    round(recent_high_close, 2),
+        "最近創高日":  last_high_date,
+        "①創60日高":  c1,
+        "②已回落":    c2,
+        "③貼MA20":    c3,
+        "④量≥門檻":   c4,
     }
 
 
 def scan_stock(code, use_cond1=True, use_cond2=True,
-               months=4, n_days=20, tol=0.03, req_delay=0.5, min_vol_lot=1000):
+               months=4, n_days=20, tol=0.03, req_delay=0.5, min_vol_lot=1000, scan_tol=0.03):
     """掃描單一股票，回傳結果 dict（無論是否符合）。"""
     df, stock_name = fetch_stock_history(code, months=months, req_delay=req_delay)
     if df is None or len(df) < 20:
@@ -947,18 +960,18 @@ def scan_stock(code, use_cond1=True, use_cond2=True,
         cond1_pass = r1.get("passed", False)
 
     if use_cond2:
-        r2 = check_cond_ma_support(df, min_vol_lot=min_vol_lot)
+        r2 = check_cond_ma_support(df, n_days=n_days, tol=scan_tol, min_vol_lot=min_vol_lot)
         result.update({
-            "站MA20未破MA10/5": "✅" if r2.get("passed")  else "❌",
-            "①>MA20":           "✅" if r2.get("①>MA20")  else "❌",
-            "②<MA10":           "✅" if r2.get("②<MA10")  else "❌",
-            "③<MA5":            "✅" if r2.get("③<MA5")   else "❌",
-            "④量≥門檻":         "✅" if r2.get("④量≥門檻") else "❌",
-            "MA5值":             r2.get("MA5",        "─"),
-            "MA10值":            r2.get("MA10",       "─"),
-            "MA20值":            r2.get("MA20",       "─"),
-            "距MA20(%)":         r2.get("距MA20(%)",  "─"),
-            "成交量(張)":        r2.get("成交量(張)", "─"),
+            "過高回測MA20":  "✅" if r2.get("passed")     else "❌",
+            "①創60日高":    "✅" if r2.get("①創60日高")  else "❌",
+            "②已回落":      "✅" if r2.get("②已回落")    else "❌",
+            "③貼MA20":      "✅" if r2.get("③貼MA20")    else "❌",
+            "④量≥門檻":     "✅" if r2.get("④量≥門檻")   else "❌",
+            "MA20值":        r2.get("MA20",       "─"),
+            "距MA20(%)":     r2.get("距MA20(%)",  "─"),
+            "近期高點":      r2.get("近期高點",    "─"),
+            "最近創高日":    r2.get("最近創高日",  "─"),
+            "成交量(張)":    r2.get("成交量(張)", "─"),
         })
         cond2_pass = r2.get("passed", False)
 
@@ -1159,8 +1172,8 @@ def render_scan_table(results, use_cond1, use_cond2):
         heads += ["MACD+KD", "①DIF>0", "②K>D", "③OSC轉正", "④K<50向上",
                   "DIF值", "OSC值", "K值", "D值"]
     if use_cond2:
-        heads += ["站MA20未破MA10/5", "①>MA20", "②<MA10", "③<MA5", "④量≥門檻",
-                  "MA5值", "MA10值", "MA20值", "距MA20(%)", "成交量(張)"]
+        heads += ["過高回測MA20", "①創60日高", "②已回落", "③貼MA20", "④量≥門檻",
+                  "MA20值", "距MA20(%)", "近期高點", "最近創高日", "成交量(張)"]
     heads += ["整體符合"]
 
     thead = "".join(f"<th>{h}</th>" for h in heads)
@@ -1177,10 +1190,10 @@ def render_scan_table(results, use_cond1, use_cond2):
             for k in ["DIF值","OSC值","K值","D值"]:
                 row += f"<td style='color:#aaa;font-size:.82rem'>{r.get(k,'─')}</td>"
         if use_cond2:
-            row += _td(r.get("站MA20未破MA10/5", "─"))
-            for k in ["①>MA20", "②<MA10", "③<MA5", "④量≥門檻"]:
+            row += _td(r.get("過高回測MA20", "─"))
+            for k in ["①創60日高", "②已回落", "③貼MA20", "④量≥門檻"]:
                 row += _td(r.get(k, "─"), is_sub=True)
-            for k in ["MA5值", "MA10值", "MA20值", "距MA20(%)", "成交量(張)"]:
+            for k in ["MA20值", "距MA20(%)", "近期高點", "最近創高日", "成交量(張)"]:
                 row += f"<td style='color:#aaa;font-size:.82rem'>{r.get(k,'─')}</td>"
         # 整體符合
         match = r.get("整體符合", "─")
@@ -1573,22 +1586,28 @@ with tab_scan:
                 "<br>③ OSC 由負轉正 &nbsp;④ K &lt; 50 後向上</small>",
                 unsafe_allow_html=True)
 
-        use_c2 = st.checkbox("條件 2：站上 MA20 但尚未站上 MA10／MA5", value=True, key="scan_c2")
+        use_c2 = st.checkbox("條件 2：股價過前高後走低，收盤回到 MA20 附近", value=True, key="scan_c2")
         if use_c2:
-            min_vol = st.number_input("最低成交量（張）", min_value=0, value=1000,
-                                      step=100, key="scan_min_vol")
+            cv1, cv2, cv3 = st.columns(3)
+            with cv1:
+                n_days  = st.slider("創高觀察期（天）", 5, 40, 20, key="scan_ndays")
+            with cv2:
+                tol_pct = st.slider("月線容忍度（%）",  1,  8,  3, key="scan_tol")
+            with cv3:
+                min_vol = st.number_input("最低成交量（張）", min_value=0,
+                                          value=1000, step=100, key="scan_min_vol")
             st.markdown(
                 "<small style='color:#888'>"
-                "① 收盤 &gt; MA20（突破月線）<br>"
-                "② 收盤 &lt; MA10（10日線尚未突破）<br>"
-                "③ 收盤 &lt; MA5 （5日線尚未突破）<br>"
-                "④ 成交量 ≥ 門檻值（先篩量再查技術）"
+                "① 近 N 天內曾創 60 日新高（突破前高）<br>"
+                "② 目前收盤已從高點走低（回落中）<br>"
+                "③ 收盤在 MA20 ± 容忍度 且站上 MA20<br>"
+                "④ 成交量 ≥ 門檻（先篩量再查技術）"
                 "</small>",
                 unsafe_allow_html=True)
         else:
             min_vol = 1000
-        tol_pct = 3
-        n_days  = 20
+            tol_pct = 3
+            n_days  = 20
 
     with param_col:
         st.markdown("**進階參數**")
@@ -1714,6 +1733,7 @@ with tab_scan:
                         tol=tol_pct / 100,
                         req_delay=0.35,
                         min_vol_lot=int(min_vol),
+                        scan_tol=tol_pct / 100,
                     )
                 except Exception as e:
                     return {"代號": code, "狀態": f"❌ {e}", "整體符合": "─"}
