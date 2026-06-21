@@ -805,10 +805,10 @@ def check_cond_macd_kd(df):
 
 def check_cond_high_pullback(df, n_days=20, tol=0.03):
     """
-    條件 2：創高後回測月線有撐
+    條件 2：創高後回測均線有撐（MA10 或 MA20 任一符合即通過）
       ① 近 n_days 天內曾創 60 日新高
-      ② 目前收盤在 MA20 ± tol 以內
-      ③ 收盤 > MA20（守住支撐）
+      ② 目前收盤在 MA10 ± tol 以內  OR  在 MA20 ± tol 以內
+      ③ 收盤 > 所回測的均線（守住支撐）
       ④ 今日成交量 < 5 日均量（縮量健康回調）
     """
     if len(df) < 60:
@@ -818,20 +818,39 @@ def check_cond_high_pullback(df, n_days=20, tol=0.03):
     high  = df["最高"].astype(float) if "最高" in df.columns else close
     vol   = df["成交量"].astype(float) if "成交量" in df.columns else pd.Series([1.0] * len(df))
 
-    ma20  = calc_ma(close, 20)
-    ma5v  = vol.rolling(5, min_periods=1).mean()
+    ma10 = calc_ma(close, 10)
+    ma20 = calc_ma(close, 20)
+    ma5v = vol.rolling(5, min_periods=1).mean()
 
     # 創 60 日新高（用前一天的 59 日最高做比較）
     prev_59 = high.shift(1).rolling(59, min_periods=20).max()
     new_h   = high > prev_59
     c1 = bool(new_h.iloc[-n_days:].any())
 
-    cur_c  = float(close.iloc[-1])
-    cur_m  = float(ma20.iloc[-1])
-    dist   = (cur_c - cur_m) / cur_m
-    c2 = bool(abs(dist) <= tol)
-    c3 = bool(cur_c > cur_m)
+    cur_c   = float(close.iloc[-1])
+    cur_m10 = float(ma10.iloc[-1])
+    cur_m20 = float(ma20.iloc[-1])
+    dist10  = (cur_c - cur_m10) / cur_m10
+    dist20  = (cur_c - cur_m20) / cur_m20
+
+    near10  = abs(dist10) <= tol and cur_c > cur_m10   # 在 MA10 上方 ±tol
+    near20  = abs(dist20) <= tol and cur_c > cur_m20   # 在 MA20 上方 ±tol
+
+    c2 = near10 or near20          # 在任一均線附近
+    c3 = cur_c > cur_m10 or cur_c > cur_m20  # 守住至少一條均線
     c4 = bool(float(vol.iloc[-1]) < float(ma5v.iloc[-1]))
+
+    # 決定主要支撐線（優先 MA10，因為更近期）
+    if near10:
+        which_ma, dist_show, ma_val = "MA10", dist10, cur_m10
+    elif near20:
+        which_ma, dist_show, ma_val = "MA20", dist20, cur_m20
+    else:
+        # 未符合時顯示距離最近的那條
+        if abs(dist10) <= abs(dist20):
+            which_ma, dist_show, ma_val = "MA10", dist10, cur_m10
+        else:
+            which_ma, dist_show, ma_val = "MA20", dist20, cur_m20
 
     # 最後創高日期
     last_new_high = "無"
@@ -843,14 +862,16 @@ def check_cond_high_pullback(df, n_days=20, tol=0.03):
             last_new_high = d.strftime("%Y/%m/%d") if hasattr(d, "strftime") else str(d)
 
     return {
-        "passed":       c1 and c2 and c3 and c4,
-        "MA20":         round(cur_m, 2),
-        "距MA20(%)":    round(dist * 100, 2),
-        "最近創高日":   last_new_high,
+        "passed":        c1 and c2 and c3 and c4,
+        "支撐線":        which_ma,
+        "MA10":          round(cur_m10, 2),
+        "MA20":          round(cur_m20, 2),
+        "距支撐(%)":     round(dist_show * 100, 2),
+        "最近創高日":    last_new_high,
         "①近創60日高":  c1,
-        "②在MA20±3%":  c2,
-        "③收盤>MA20":  c3,
-        "④縮量回調":    c4,
+        "②在均線±tol":  c2,
+        "③收>均線":      c3,
+        "④縮量回調":     c4,
     }
 
 
@@ -893,14 +914,16 @@ def scan_stock(code, use_cond1=True, use_cond2=True,
     if use_cond2:
         r2 = check_cond_high_pullback(df, n_days=n_days, tol=tol)
         result.update({
-            "創高回月線": "✅" if r2.get("passed") else "❌",
-            "①創60日高":   "✅" if r2.get("①近創60日高") else "❌",
-            "②在MA20±3%":  "✅" if r2.get("②在MA20±3%") else "❌",
-            "③收>MA20":    "✅" if r2.get("③收盤>MA20") else "❌",
-            "④縮量":        "✅" if r2.get("④縮量回調")  else "❌",
-            "MA20值":      r2.get("MA20",      "─"),
-            "距MA20(%)":   r2.get("距MA20(%)", "─"),
-            "最近創高日":   r2.get("最近創高日", "─"),
+            "創高回均線":  "✅" if r2.get("passed") else "❌",
+            "支撐線":      r2.get("支撐線", "─"),
+            "①創60日高":  "✅" if r2.get("①近創60日高") else "❌",
+            "②在均線±%":  "✅" if r2.get("②在均線±tol") else "❌",
+            "③收>均線":   "✅" if r2.get("③收>均線")    else "❌",
+            "④縮量":       "✅" if r2.get("④縮量回調")   else "❌",
+            "MA10值":      r2.get("MA10",       "─"),
+            "MA20值":      r2.get("MA20",       "─"),
+            "距支撐(%)":   r2.get("距支撐(%)",  "─"),
+            "最近創高日":  r2.get("最近創高日",  "─"),
         })
         cond2_pass = r2.get("passed", False)
 
@@ -1101,8 +1124,8 @@ def render_scan_table(results, use_cond1, use_cond2):
         heads += ["MACD+KD", "①DIF>0", "②K>D", "③OSC轉正", "④K<50向上",
                   "DIF值", "OSC值", "K值", "D值"]
     if use_cond2:
-        heads += ["創高回月線", "①創60日高", "②在MA20±3%", "③收>MA20", "④縮量",
-                  "MA20值", "距MA20(%)", "最近創高日"]
+        heads += ["創高回均線", "支撐線", "①創60日高", "②在均線±%", "③收>均線", "④縮量",
+                  "MA10值", "MA20值", "距支撐(%)", "最近創高日"]
     heads += ["整體符合"]
 
     thead = "".join(f"<th>{h}</th>" for h in heads)
@@ -1118,10 +1141,14 @@ def render_scan_table(results, use_cond1, use_cond2):
             for k in ["DIF值","OSC值","K值","D值"]:
                 row += f"<td style='color:#aaa;font-size:.82rem'>{r.get(k,'─')}</td>"
         if use_cond2:
-            row += _td(r.get("創高回月線", "─"))
-            for k in ["①創60日高","②在MA20±3%","③收>MA20","④縮量"]:
+            row += _td(r.get("創高回均線", "─"))
+            # 支撐線標色
+            ma_lbl = r.get("支撐線", "─")
+            ma_color = "#e8a838" if ma_lbl == "MA10" else "#7ab8f5" if ma_lbl == "MA20" else "#666"
+            row += f"<td style='color:{ma_color};font-weight:700;font-size:.82rem'>{ma_lbl}</td>"
+            for k in ["①創60日高","②在均線±%","③收>均線","④縮量"]:
                 row += _td(r.get(k, "─"), is_sub=True)
-            for k in ["MA20值","距MA20(%)","最近創高日"]:
+            for k in ["MA10值","MA20值","距支撐(%)","最近創高日"]:
                 row += f"<td style='color:#aaa;font-size:.82rem'>{r.get(k,'─')}</td>"
         # 整體符合
         match = r.get("整體符合", "─")
@@ -1437,11 +1464,20 @@ with tab_scan:
 
     # ── 掃描範圍 ──────────────────────────────────────────────────────────────
     st.markdown("#### 掃描範圍")
+    # 台灣前50成分股（台灣50 ETF 0050 成分，約略）
+    TW50_CODES = (
+        "2330,2317,2454,2382,2308,3711,2303,3034,2357,2379,"
+        "2395,2881,2882,2886,2891,2892,5880,2884,2885,1301,"
+        "1303,1326,6505,2002,1101,2207,2105,2912,2801,2880,"
+        "4904,2412,3045,2301,3008,2474,6669,2376,5871,2327,"
+        "2408,4938,2603,2615,2609,2354,2887,3037,2353,2345"
+    )
+
     scope_col, _ = st.columns([3, 1])
     with scope_col:
         scan_scope = st.radio(
             "掃描範圍",
-            ["自訂清單", "全市場・上市（TWSE）", "全市場・上櫃（TPEx）", "全市場・上市＋上櫃"],
+            ["自訂清單", "台灣前50", "全市場・上市（TWSE）", "全市場・上櫃（TPEx）", "全市場・上市＋上櫃"],
             index=0, horizontal=True, label_visibility="collapsed",
             key="scan_scope",
         )
@@ -1451,6 +1487,12 @@ with tab_scan:
         "2395,2881,2882,2886,2891,2892,5880,2884,2885,1301,"
         "1303,1326,6505,2002,1101,2207,2105,2912,2801,2880"
     )
+
+    if scan_scope == "台灣前50":
+        scope_codes = [c.strip() for c in TW50_CODES.replace("\n","").split(",") if c.strip()]
+        scope_codes = list(dict.fromkeys(scope_codes))
+        st.info(f"台灣前50成分股（共 {len(scope_codes)} 支），約 **2–5 分鐘**完成掃描。")
+        scan_input = TW50_CODES
 
     if scan_scope == "自訂清單":
         scan_input = st.text_area(
@@ -1495,7 +1537,7 @@ with tab_scan:
                 "<br>③ OSC 由負轉正 &nbsp;④ K &lt; 50 後向上</small>",
                 unsafe_allow_html=True)
 
-        use_c2 = st.checkbox("條件 2：創高後回測月線有撐", value=True, key="scan_c2")
+        use_c2 = st.checkbox("條件 2：創高後回測均線有撐（MA10 / MA20）", value=True, key="scan_c2")
         if use_c2:
             n_days  = st.slider("創高觀察期（天）", 10, 40, 20, key="scan_ndays")
             tol_pct = st.slider("月線容忍度（%）",   1,  6,  3, key="scan_tol")
@@ -1510,7 +1552,7 @@ with tab_scan:
                                 index=0, horizontal=True, key="scan_match")
 
         # 預估時間
-        if scan_scope == "自訂清單":
+        if scan_scope in ("自訂清單", "台灣前50"):
             est_n = len(scope_codes) if scope_codes else 0
         else:
             est_n = 900 if inc_twse and not inc_tpex else (
@@ -1547,7 +1589,7 @@ with tab_scan:
             st.warning("請至少啟用一個篩選條件")
         else:
             # 1. 取得代號清單
-            if scan_scope == "自訂清單":
+            if scan_scope in ("自訂清單", "台灣前50"):
                 codes_to_scan = scope_codes
                 if not codes_to_scan:
                     st.warning("請先輸入股票代號")
@@ -1657,14 +1699,16 @@ with tab_scan:
         else:
             st.info("目前沒有符合條件的股票，可嘗試放寬篩選參數或選擇「全部顯示」。")
     else:
-        if scan_scope == "自訂清單":
-            hint_n = f"**{len(scope_codes)} 支**"
-            hint_t = f"約 {len(scope_codes) * scan_months * 0.5 / scan_workers / 60:.1f} 分鐘"
+        if scan_scope in ("自訂清單", "台灣前50"):
+            n_est = len(scope_codes) if scope_codes else 0
+            hint_t = f"{n_est * scan_months * 0.5 / scan_workers / 60:.1f} 分鐘" if n_est else "─"
+            hint_n = f"**{n_est} 支**（{scan_scope}）"
         else:
             hint_n = "全市場（上市＋上櫃約 1600 支）"
             hint_t = "25–40 分鐘（視執行緒數與月數而定）"
         st.info(
             f"設定條件後按「▶ 開始掃描」。\n\n"
-            f"目前設定：{hint_n}，預計 {hint_t}。\n\n"
-            "**提示**：全市場掃描建議選「2 個月」+ 「3 執行緒」以縮短時間。"
+            f"目前設定：{hint_n}，預計約 {hint_t}。\n\n"
+            "**提示**：全市場掃描建議選「2 個月」＋「3 執行緒」以縮短時間；"
+            "條件 2 支撐線會自動判斷 MA10（10日線）或 MA20（月線），任一符合即通過。"
         )
