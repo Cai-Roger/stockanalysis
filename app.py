@@ -805,41 +805,26 @@ def check_cond_macd_kd(df):
 
 def check_cond_ma_support(df, tol=0.03):
     """
-    條件 2：站上均線有撐（MA10 或 MA20 任一符合即通過）
-      收盤在 MA10 ± tol 以內且 > MA10
-      OR
-      收盤在 MA20 ± tol 以內且 > MA20
+    條件 2：站上月線（MA20）有撐
+      收盤 > MA20 且收盤在 MA20 ± tol 以內
     """
     if len(df) < 20:
         return {"passed": False, "reason": "資料不足"}
 
     close   = df["收盤"].astype(float)
-    ma10    = calc_ma(close, 10)
     ma20    = calc_ma(close, 20)
 
     cur_c   = float(close.iloc[-1])
-    cur_m10 = float(ma10.iloc[-1])
     cur_m20 = float(ma20.iloc[-1])
-    dist10  = (cur_c - cur_m10) / cur_m10
     dist20  = (cur_c - cur_m20) / cur_m20
 
-    # 站在均線上方且距離在容忍度內
-    on_ma10 = cur_c > cur_m10 and abs(dist10) <= tol
     on_ma20 = cur_c > cur_m20 and abs(dist20) <= tol
 
-    passed = on_ma10 and on_ma20   # 兩條都要達成
-
-    which_ma = "MA10+MA20" if passed else ("MA10" if on_ma10 else ("MA20" if on_ma20 else "─"))
-
     return {
-        "passed":     passed,
-        "支撐線":     which_ma,
-        "MA10":       round(cur_m10, 2),
-        "MA20":       round(cur_m20, 2),
-        "距MA10(%)":  round(dist10 * 100, 2),
-        "距MA20(%)":  round(dist20 * 100, 2),
-        "站MA10":     on_ma10,
-        "站MA20":     on_ma20,
+        "passed":    on_ma20,
+        "MA20":      round(cur_m20, 2),
+        "距MA20(%)": round(dist20 * 100, 2),
+        "站MA20":    on_ma20,
     }
 
 
@@ -882,14 +867,9 @@ def scan_stock(code, use_cond1=True, use_cond2=True,
     if use_cond2:
         r2 = check_cond_ma_support(df, tol=tol)
         result.update({
-            "均線有撐":   "✅" if r2.get("passed") else "❌",
-            "支撐線":     r2.get("支撐線", "─"),
-            "站MA10":     "✅" if r2.get("站MA10") else "❌",
-            "站MA20":     "✅" if r2.get("站MA20") else "❌",
-            "MA10值":     r2.get("MA10",      "─"),
-            "MA20值":     r2.get("MA20",      "─"),
-            "距MA10(%)":  r2.get("距MA10(%)", "─"),
-            "距MA20(%)":  r2.get("距MA20(%)", "─"),
+            "站月線":    "✅" if r2.get("passed") else "❌",
+            "MA20值":    r2.get("MA20",      "─"),
+            "距MA20(%)": r2.get("距MA20(%)", "─"),
         })
         cond2_pass = r2.get("passed", False)
 
@@ -1090,8 +1070,7 @@ def render_scan_table(results, use_cond1, use_cond2):
         heads += ["MACD+KD", "①DIF>0", "②K>D", "③OSC轉正", "④K<50向上",
                   "DIF值", "OSC值", "K值", "D值"]
     if use_cond2:
-        heads += ["均線有撐", "支撐線", "站MA10", "站MA20",
-                  "MA10值", "MA20值", "距MA10(%)", "距MA20(%)"]
+        heads += ["站月線", "MA20值", "距MA20(%)"]
     heads += ["整體符合"]
 
     thead = "".join(f"<th>{h}</th>" for h in heads)
@@ -1107,13 +1086,8 @@ def render_scan_table(results, use_cond1, use_cond2):
             for k in ["DIF值","OSC值","K值","D值"]:
                 row += f"<td style='color:#aaa;font-size:.82rem'>{r.get(k,'─')}</td>"
         if use_cond2:
-            row += _td(r.get("均線有撐", "─"))
-            ma_lbl = r.get("支撐線", "─")
-            ma_color = "#e8a838" if ma_lbl == "MA10" else "#7ab8f5" if ma_lbl == "MA20" else "#555"
-            row += f"<td style='color:{ma_color};font-weight:700;font-size:.88rem'>{ma_lbl}</td>"
-            for k in ["站MA10", "站MA20"]:
-                row += _td(r.get(k, "─"), is_sub=True)
-            for k in ["MA10值", "MA20值", "距MA10(%)", "距MA20(%)"]:
+            row += _td(r.get("站月線", "─"))
+            for k in ["MA20值", "距MA20(%)"]:
                 row += f"<td style='color:#aaa;font-size:.82rem'>{r.get(k,'─')}</td>"
         # 整體符合
         match = r.get("整體符合", "─")
@@ -1506,12 +1480,11 @@ with tab_scan:
                 "<br>③ OSC 由負轉正 &nbsp;④ K &lt; 50 後向上</small>",
                 unsafe_allow_html=True)
 
-        use_c2 = st.checkbox("條件 2：站上均線有撐（MA10 或 MA20）", value=True, key="scan_c2")
+        use_c2 = st.checkbox("條件 2：站上月線（MA20）有撐", value=True, key="scan_c2")
         if use_c2:
-            tol_pct = st.slider("均線容忍度（%）", 1, 6, 3, key="scan_tol")
+            tol_pct = st.slider("月線容忍度（%）", 1, 6, 3, key="scan_tol")
             st.markdown(
-                "<small style='color:#888'>收盤在 MA10 ± 容忍度 且站上 MA10<br>"
-                "<b>AND</b> 收盤在 MA20 ± 容忍度 且站上 MA20（兩條同時達成）</small>",
+                "<small style='color:#888'>收盤 &gt; MA20 且在 MA20 ± 容忍度以內</small>",
                 unsafe_allow_html=True)
         else:
             tol_pct = 3
